@@ -1631,7 +1631,8 @@ static noinline void vmwrite_error(unsigned long field, unsigned long value)
 static __always_inline void __vmcs_writel(unsigned long field, unsigned long value)
 {
 	u8 error;
-
+    // #define ASM_VMX_VMWRITE_RAX_RDX   ".byte 0x0f, 0x79, 0xd0"
+    //将RAX内容写入到RDX索引到的VMCS阑。RAX就是value rdx的值是field传递
 	asm volatile (__ex(ASM_VMX_VMWRITE_RAX_RDX) "; setna %0"
 		       : "=q"(error) : "a"(value), "d"(field) : "cc");
 	if (unlikely(error))
