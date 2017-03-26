@@ -2395,30 +2395,38 @@ static int create_vcpu_fd(struct kvm_vcpu *vcpu)
 /*
  * Creates some virtual cpus.  Good luck creating more than one.
  */
+ /*创建一些vcpu，为虚拟机创建vcpu的ioctl调用的入口函数，创建vcpu结构并且初始化，并且将其填入kvm的结构.*/
+
 static int kvm_vm_ioctl_create_vcpu(struct kvm *kvm, u32 id)
 {
 	int r;
-	struct kvm_vcpu *vcpu;
+	struct kvm_vcpu *vcpu;//定义一个vcpu pointer
 
 	if (id >= KVM_MAX_VCPU_ID)
-		return -EINVAL;
+		return -EINVAL;//id已经超过了定义的最大的vcpu，id的话，返回失败
 
 	mutex_lock(&kvm->lock);
+	//如果创建的vcpu数量已经超过了KVM_MAX_VCPUS定义的最大的数量
 	if (kvm->created_vcpus == KVM_MAX_VCPUS) {
 		mutex_unlock(&kvm->lock);
 		return -EINVAL;
 	}
 
-	kvm->created_vcpus++;
+	kvm->created_vcpus++;//kvm结构体中追踪创建的vcpu数量的create_vcpus加一
 	mutex_unlock(&kvm->lock);
 
-	vcpu = kvm_arch_vcpu_create(kvm, id);
+	vcpu = kvm_arch_vcpu_create(kvm, id);//创建vcpu结构，对于intel x86最终调用vmx_create_vcpu
 	if (IS_ERR(vcpu)) {
 		r = PTR_ERR(vcpu);
-		goto vcpu_decrement;
+		goto vcpu_decrement;//vcpu创建失败
 	}
 
 	preempt_notifier_init(&vcpu->preempt_notifier, &kvm_preempt_ops);
+ /* 
+     * 设置vcpu结构，主要调用kvm_x86_ops->vcpu_load，KVM虚拟机VCPU数据结构载入物理CPU，
+     * 并进行虚拟机mmu相关设置，比如进行ept页表的相关初始工作或影子页表
+     * 相关的设置。
+     */
 
 	r = kvm_arch_vcpu_setup(vcpu);
 	if (r)
@@ -2429,28 +2437,33 @@ static int kvm_vm_ioctl_create_vcpu(struct kvm *kvm, u32 id)
 		r = -EEXIST;
 		goto unlock_vcpu_destroy;
 	}
+    /*
+     * kvm->vcpus[]数组包括该vm的所有vcpu，定义为KVM_MAX_VCPUS大小的数组。
+     * 在kvm结构初始化时，其中所有成员都初始化为0，在vcpu还没有
+     * 分配之前，如果不为0，那就是bug了。
+     */
 
 	BUG_ON(kvm->vcpus[atomic_read(&kvm->online_vcpus)]);
 
 	/* Now it's all set up, let userspace reach it */
 	kvm_get_kvm(kvm);
-	r = create_vcpu_fd(vcpu);
+	r = create_vcpu_fd(vcpu);// 为新创建的vcpu创建对应的fd，以便于后续通过该fd进行ioctl操作
 	if (r < 0) {
-		kvm_put_kvm(kvm);
+		kvm_put_kvm(kvm);//fd创建不成功，free 一个vm
 		goto unlock_vcpu_destroy;
 	}
 
-	kvm->vcpus[atomic_read(&kvm->online_vcpus)] = vcpu;
+	kvm->vcpus[atomic_read(&kvm->online_vcpus)] = vcpu;[]数组中
 
 	/*
 	 * Pairs with smp_rmb() in kvm_get_vcpu.  Write kvm->vcpus
 	 * before kvm->online_vcpu's incremented value.
 	 */
 	smp_wmb();
-	atomic_inc(&kvm->online_vcpus);
+	atomic_inc(&kvm->online_vcpus);//原子性增加online_vcpus的数量
 
 	mutex_unlock(&kvm->lock);
-	kvm_arch_vcpu_postcreate(vcpu);
+	kvm_arch_vcpu_postcreate(vcpu);// 架构相关的善后工作，比如再次调用vcpu_load，以及tsc相关处理
 	return r;
 
 unlock_vcpu_destroy:
@@ -2459,7 +2472,7 @@ vcpu_destroy:
 	kvm_arch_vcpu_destroy(vcpu);
 vcpu_decrement:
 	mutex_lock(&kvm->lock);
-	kvm->created_vcpus--;
+	kvm->created_vcpus--;//减少created_vcpus的数量
 	mutex_unlock(&kvm->lock);
 	return r;
 }
