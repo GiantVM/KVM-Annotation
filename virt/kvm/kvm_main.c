@@ -139,15 +139,20 @@ bool kvm_is_reserved_pfn(kvm_pfn_t pfn)
  */
 int vcpu_load(struct kvm_vcpu *vcpu)
 {
-	int cpu;
+    int cpu;
 
-	if (mutex_lock_killable(&vcpu->mutex))
-		return -EINTR;
-	cpu = get_cpu();
-	preempt_notifier_register(&vcpu->preempt_notifier);
-	kvm_arch_vcpu_load(vcpu, cpu);
-	put_cpu();
-	return 0;
+    if (mutex_lock_killable(&vcpu->mutex))
+        return -EINTR;
+    // 关闭抢占
+    cpu = get_cpu();
+    // 注册preempt notifier，当发生内核抢占时会调用回调函数进行处理 kvm_sched_in (被调度之前)和 kvm_sched_out (被抢占之后)
+    // 这样比每次执行修改VMCS都要关闭抢占性能好
+    preempt_notifier_register(&vcpu->preempt_notifier);
+    // 将vCPU绑定的pCPU上
+    kvm_arch_vcpu_load(vcpu, cpu);
+    // 重新打开抢占
+    put_cpu();
+    return 0;
 }
 EXPORT_SYMBOL_GPL(vcpu_load);
 
@@ -1489,7 +1494,7 @@ static int hva_to_pfn_remapped(struct vm_area_struct *vma,
 	 * Whoever called remap_pfn_range is also going to call e.g.
 	 * unmap_mapping_range before the underlying pages are freed,
 	 * causing a call to our MMU notifier.
-	 */ 
+	 */
 	kvm_get_pfn(pfn);
 
 	*p_pfn = pfn;
@@ -2422,7 +2427,7 @@ static int kvm_vm_ioctl_create_vcpu(struct kvm *kvm, u32 id)
 	}
 
 	preempt_notifier_init(&vcpu->preempt_notifier, &kvm_preempt_ops);
- /* 
+ /*
      * 设置vcpu结构，主要调用kvm_x86_ops->vcpu_load，KVM虚拟机VCPU数据结构载入物理CPU，
      * 并进行虚拟机mmu相关设置，比如进行ept页表的相关初始工作或影子页表
      * 相关的设置。
