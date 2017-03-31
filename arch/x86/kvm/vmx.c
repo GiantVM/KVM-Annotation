@@ -9058,101 +9058,122 @@ static void vmx_free_vcpu(struct kvm_vcpu *vcpu)
 	kmem_cache_free(kvm_vcpu_cache, vmx);
 }
 
+// 根据硬件创建vcpu
 static struct kvm_vcpu *vmx_create_vcpu(struct kvm *kvm, unsigned int id)
 {
-	int err;
-	struct vcpu_vmx *vmx = kmem_cache_zalloc(kvm_vcpu_cache, GFP_KERNEL);
-	int cpu;
+    int err;
+    // 分配vcpu运行环境结构的内存
+    struct vcpu_vmx *vmx = kmem_cache_zalloc(kvm_vcpu_cache, GFP_KERNEL);
+    int cpu;
 
-	if (!vmx)
-		return ERR_PTR(-ENOMEM);
+    if (!vmx)
+        return ERR_PTR(-ENOMEM);
 
-	vmx->vpid = allocate_vpid();
+    // 分配vpid(Virtual-Processor Identifier)，用于唯一标识vCPU
+    vmx->vpid = allocate_vpid();
 
-	err = kvm_vcpu_init(&vmx->vcpu, kvm, id);
-	if (err)
-		goto free_vcpu;
+    // 初始化vcpu结构
+    err = kvm_vcpu_init(&vmx->vcpu, kvm, id);
+    if (err)
+        goto free_vcpu;
 
-	err = -ENOMEM;
+    err = -ENOMEM;
 
-	/*
-	 * If PML is turned on, failure on enabling PML just results in failure
-	 * of creating the vcpu, therefore we can simplify PML logic (by
-	 * avoiding dealing with cases, such as enabling PML partially on vcpus
-	 * for the guest, etc.
-	 */
-	if (enable_pml) {
-		vmx->pml_pg = alloc_page(GFP_KERNEL | __GFP_ZERO);
-		if (!vmx->pml_pg)
-			goto uninit_vcpu;
-	}
+    /*
+     * If PML is turned on, failure on enabling PML just results in failure
+     * of creating the vcpu, therefore we can simplify PML logic (by
+     * avoiding dealing with cases, such as enabling PML partially on vcpus
+     * for the guest, etc.
+     */
+    // 为Page Modification Logging分配page
+    // PML是在用于记录哪些page被标记为dirty的内存区域
+    // http://www.intel.com/content/dam/www/public/us/en/documents/white-papers/page-modification-logging-vmm-white-paper.pdf
+    if (enable_pml) {
+        vmx->pml_pg = alloc_page(GFP_KERNEL | __GFP_ZERO);
+        if (!vmx->pml_pg)
+            goto uninit_vcpu;
+    }
 
-	vmx->guest_msrs = kmalloc(PAGE_SIZE, GFP_KERNEL);
-	BUILD_BUG_ON(ARRAY_SIZE(vmx_msr_index) * sizeof(vmx->guest_msrs[0])
-		     > PAGE_SIZE);
+    // 为guest MSR分配内存
+    vmx->guest_msrs = kmalloc(PAGE_SIZE, GFP_KERNEL);
+    BUILD_BUG_ON(ARRAY_SIZE(vmx_msr_index) * sizeof(vmx->guest_msrs[0])
+             > PAGE_SIZE);
 
-	if (!vmx->guest_msrs)
-		goto free_pml;
+    if (!vmx->guest_msrs)
+        goto free_pml;
 
-	vmx->loaded_vmcs = &vmx->vmcs01;
-	vmx->loaded_vmcs->vmcs = alloc_vmcs();
-	if (!vmx->loaded_vmcs->vmcs)
-		goto free_msrs;
-	if (!vmm_exclusive)
-		kvm_cpu_vmxon(__pa(per_cpu(vmxarea, raw_smp_processor_id())));
-	loaded_vmcs_init(vmx->loaded_vmcs);
-	if (!vmm_exclusive)
-		kvm_cpu_vmxoff();
+    // 设置vmx->loaded_vmcs指向loaded_vmcs(描述vcpu当前加载的VMCS的结构)
+    vmx->loaded_vmcs = &vmx->vmcs01;
+    // 为vcpu创建vmcs，并设置到loaded_vmcs中
+    vmx->loaded_vmcs->vmcs = alloc_vmcs();
+    if (!vmx->loaded_vmcs->vmcs)
+        goto free_msrs;
+    // vmm_exclusive为0表示严格模式，即只有需要做VMX operation时才进入到VMX模式，否则一直保持在普通模式下
+    if (!vmm_exclusive)
+        // 进入VMX operation模式
+        kvm_cpu_vmxon(__pa(per_cpu(vmxarea, raw_smp_processor_id())));
+    // 初始化loaded_vmcs
+    loaded_vmcs_init(vmx->loaded_vmcs);
+    if (!vmm_exclusive)
+        // 退出VMX operation模式
+        kvm_cpu_vmxoff();
 
-	cpu = get_cpu();
-	vmx_vcpu_load(&vmx->vcpu, cpu);
-	vmx->vcpu.cpu = cpu;
-	err = vmx_vcpu_setup(vmx);
-	vmx_vcpu_put(&vmx->vcpu);
-	put_cpu();
-	if (err)
-		goto free_vmcs;
-	if (cpu_need_virtualize_apic_accesses(&vmx->vcpu)) {
-		err = alloc_apic_access_page(kvm);
-		if (err)
-			goto free_vmcs;
-	}
+    // 关闭抢占，获取当前的pcpu id
+    cpu = get_cpu();
+    // 让cpu加载vcpu
+    vmx_vcpu_load(&vmx->vcpu, cpu);
+    vmx->vcpu.cpu = cpu;
+    // 初始化vcpu，主要是通过VMWRITE设置vmcs内容
+    err = vmx_vcpu_setup(vmx);
+    // 加载host状态，相当于vmx_vcpu_load的反操作
+    vmx_vcpu_put(&vmx->vcpu);
+    // 开启抢占
+    put_cpu();
+    if (err)
+        goto free_vmcs;
+    // APIC???
+    if (cpu_need_virtualize_apic_accesses(&vmx->vcpu)) {
+        err = alloc_apic_access_page(kvm);
+        if (err)
+            goto free_vmcs;
+    }
+    // 如果支持ept
+    if (enable_ept) {
+        if (!kvm->arch.ept_identity_map_addr)
+            kvm->arch.ept_identity_map_addr =
+                VMX_EPT_IDENTITY_PAGETABLE_ADDR;
+        // 初始化identity页表???
+        err = init_rmode_identity_map(kvm);
+        if (err)
+            goto free_vmcs;
+    }
+    // 嵌套虚拟化相关初始化
+    if (nested) {
+        nested_vmx_setup_ctls_msrs(vmx);
 
-	if (enable_ept) {
-		if (!kvm->arch.ept_identity_map_addr)
-			kvm->arch.ept_identity_map_addr =
-				VMX_EPT_IDENTITY_PAGETABLE_ADDR;
-		err = init_rmode_identity_map(kvm);
-		if (err)
-			goto free_vmcs;
-	}
+    }
 
-	if (nested) {
-		nested_vmx_setup_ctls_msrs(vmx);
-		vmx->nested.vpid02 = allocate_vpid();
-	}
+    vmx->nested.posted_intr_nv = -1;
+    vmx->nested.current_vmptr = -1ull;
+    vmx->nested.current_vmcs12 = NULL;
 
-	vmx->nested.posted_intr_nv = -1;
-	vmx->nested.current_vmptr = -1ull;
-	vmx->nested.current_vmcs12 = NULL;
+    vmx->msr_ia32_feature_control_valid_bits = FEATURE_CONTROL_LOCKED;
 
-	vmx->msr_ia32_feature_control_valid_bits = FEATURE_CONTROL_LOCKED;
-
-	return &vmx->vcpu;
+    return &vmx->vcpu;
 
 free_vmcs:
-	free_vpid(vmx->nested.vpid02);
-	free_loaded_vmcs(vmx->loaded_vmcs);
+    free_vpid(vmx->nested.vpid02);
+    free_loaded_vmcs(vmx->loaded_vmcs);
 free_msrs:
-	kfree(vmx->guest_msrs);
+    kfree(vmx->guest_msrs);
 free_pml:
-	vmx_destroy_pml_buffer(vmx);
+    vmx_destroy_pml_buffer(vmx);
 uninit_vcpu:
-	kvm_vcpu_uninit(&vmx->vcpu);
+    kvm_vcpu_uninit(&vmx->vcpu);
 free_vcpu:
-	free_vpid(vmx->vpid);
-	kmem_cache_free(kvm_vcpu_cache, vmx);
-	return ERR_PTR(err);
+    free_vpid(vmx->vpid);
+    kmem_cache_free(kvm_vcpu_cache, vmx);
+    return ERR_PTR(err);
 }
 
 static void __init vmx_check_processor_compat(void *rtn)
@@ -9982,7 +10003,7 @@ static void prepare_vmcs02(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12)
 	/* vmcs12's VM_ENTRY_LOAD_IA32_EFER and VM_ENTRY_IA32E_MODE are
 	 * emulated by vmx_set_efer(), below.
 	 */
-	vm_entry_controls_init(vmx, 
+	vm_entry_controls_init(vmx,
 		(vmcs12->vm_entry_controls & ~VM_ENTRY_LOAD_IA32_EFER &
 			~VM_ENTRY_IA32E_MODE) |
 		(vmcs_config.vmentry_ctrl & ~VM_ENTRY_IA32E_MODE));

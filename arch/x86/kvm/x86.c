@@ -7380,53 +7380,64 @@ void kvm_arch_vcpu_free(struct kvm_vcpu *vcpu)
 	free_cpumask_var(wbinvd_dirty_mask);
 }
 
+// 根据架构创建vcpu
 struct kvm_vcpu *kvm_arch_vcpu_create(struct kvm *kvm,
-						unsigned int id)
+                        unsigned int id)
 {
-	struct kvm_vcpu *vcpu;
+    struct kvm_vcpu *vcpu;
+    // 如果TSC不稳定，但有可用vcpu(online)，输出错误但继续
+    if (check_tsc_unstable() && atomic_read(&kvm->online_vcpus) != 0)
+        printk_once(KERN_WARNING
+        "kvm: SMP vm created on host with unstable TSC; "
+        "guest TSC will not be reliable\n");
 
-	if (check_tsc_unstable() && atomic_read(&kvm->online_vcpus) != 0)
-		printk_once(KERN_WARNING
-		"kvm: SMP vm created on host with unstable TSC; "
-		"guest TSC will not be reliable\n");
+    // 根据平台创建vcpu，调用 vmx_create_vcpu
+    vcpu = kvm_x86_ops->vcpu_create(kvm, id);
 
-	vcpu = kvm_x86_ops->vcpu_create(kvm, id);
-
-	return vcpu;
+    return vcpu;
 }
 
+// 根据架构设置kvm_vcpu
 int kvm_arch_vcpu_setup(struct kvm_vcpu *vcpu)
 {
-	int r;
-
-	kvm_vcpu_mtrr_init(vcpu);
-	r = vcpu_load(vcpu);
-	if (r)
-		return r;
-	kvm_vcpu_reset(vcpu, false);
-	kvm_mmu_setup(vcpu);
-	vcpu_put(vcpu);
-	return r;
+    int r;
+    // 初始化kvm_mtrr(memory type range register)???
+    //
+    kvm_vcpu_mtrr_init(vcpu);
+    // 切换vcpu
+    r = vcpu_load(vcpu);
+    if (r)
+        return r;
+    // 重设kvm_vcpu，包括VMCS
+    kvm_vcpu_reset(vcpu, false);
+    // 初始化MMU
+    kvm_mmu_setup(vcpu);
+    vcpu_put(vcpu);
+    return r;
 }
 
 void kvm_arch_vcpu_postcreate(struct kvm_vcpu *vcpu)
 {
-	struct msr_data msr;
-	struct kvm *kvm = vcpu->kvm;
+    struct msr_data msr;
+    struct kvm *kvm = vcpu->kvm;
+    // 再次重新加载vcpu
+    if (vcpu_load(vcpu))
+        return;
 
-	if (vcpu_load(vcpu))
-		return;
-	msr.data = 0x0;
-	msr.index = MSR_IA32_TSC;
-	msr.host_initiated = true;
-	kvm_write_tsc(vcpu, &msr);
-	vcpu_put(vcpu);
+    msr.data = 0x0;
+    msr.index = MSR_IA32_TSC;
+    msr.host_initiated = true;
+    // 更新TSC
+    kvm_write_tsc(vcpu, &msr);
+    vcpu_put(vcpu);
 
-	if (!kvmclock_periodic_sync)
-		return;
+    if (!kvmclock_periodic_sync)
+        return;
 
-	schedule_delayed_work(&kvm->arch.kvmclock_sync_work,
-					KVMCLOCK_SYNC_PERIOD);
+    // 如果开启了kvmclock_periodic_sync(默认)
+    // 延迟(300 * HZ)后调用 kvmclock_sync_fn
+    schedule_delayed_work(&kvm->arch.kvmclock_sync_work,
+                    KVMCLOCK_SYNC_PERIOD);
 }
 
 void kvm_arch_vcpu_destroy(struct kvm_vcpu *vcpu)
