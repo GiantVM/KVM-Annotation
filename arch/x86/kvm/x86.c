@@ -1164,48 +1164,57 @@ void kvm_set_pending_timer(struct kvm_vcpu *vcpu)
 	kvm_make_request(KVM_REQ_PENDING_TIMER, vcpu);
 }
 
+// 计算VM启动时间，写入到wall_clock中
 static void kvm_write_wall_clock(struct kvm *kvm, gpa_t wall_clock)
 {
-	int version;
-	int r;
-	struct pvclock_wall_clock wc;
-	struct timespec64 boot;
+    int version;
+    int r;
+    struct pvclock_wall_clock wc;
+    struct timespec64 boot;
 
-	if (!wall_clock)
-		return;
+    if (!wall_clock)
+        return;
 
-	r = kvm_read_guest(kvm, wall_clock, &version, sizeof(version));
-	if (r)
-		return;
+    // 从guest的wall_clock(根据gpa)读出version
+    r = kvm_read_guest(kvm, wall_clock, &version, sizeof(version));
+    if (r)
+        return;
 
-	if (version & 1)
-		++version;  /* first time write, random junk */
+    // version为奇数，但明明没在写，是异常情况，需要先修复为偶数
+    if (version & 1)
+        ++version;  /* first time write, random junk */
 
-	++version;
+    // 写前设置奇数，表示正在修改
+    ++version;
 
-	if (kvm_write_guest(kvm, wall_clock, &version, sizeof(version)))
-		return;
+    // 把更新后的version写回
+    if (kvm_write_guest(kvm, wall_clock, &version, sizeof(version)))
+        return;
 
-	/*
-	 * The guest calculates current wall clock time by adding
-	 * system time (updated by kvm_guest_time_update below) to the
-	 * wall clock specified here.  guest system time equals host
-	 * system time for us, thus we must fill in host boot time here.
-	 */
-	getboottime64(&boot);
+    /*
+     * The guest calculates current wall clock time by adding
+     * system time (updated by kvm_guest_time_update below) to the
+     * wall clock specified here.  guest system time equals host
+     * system time for us, thus we must fill in host boot time here.
+     */
+    // 获取host启动时的时间戳
+    getboottime64(&boot);
 
-	if (kvm->arch.kvmclock_offset) {
-		struct timespec64 ts = ns_to_timespec64(kvm->arch.kvmclock_offset);
-		boot = timespec64_sub(boot, ts);
-	}
-	wc.sec = (u32)boot.tv_sec; /* overflow in 2106 guest time */
-	wc.nsec = boot.tv_nsec;
-	wc.version = version;
+    // kvmclock_offset为host启动后到VM启动的相对时间(负数)，用host启动时间减去它(相等于加)得到VM启动的时间戳
+    if (kvm->arch.kvmclock_offset) {
+        struct timespec64 ts = ns_to_timespec64(kvm->arch.kvmclock_offset);
+        boot = timespec64_sub(boot, ts);
+    }
+    wc.sec = (u32)boot.tv_sec; /* overflow in 2106 guest time */
+    wc.nsec = boot.tv_nsec;
+    wc.version = version;
 
-	kvm_write_guest(kvm, wall_clock, &wc, sizeof(wc));
-
-	version++;
-	kvm_write_guest(kvm, wall_clock, &version, sizeof(version));
+    // 更新时间
+    kvm_write_guest(kvm, wall_clock, &wc, sizeof(wc));
+    // 再次更新version，此时成为偶数，表示写完了
+    version++;
+    // 把更新后的version写回
+    kvm_write_guest(kvm, wall_clock, &version, sizeof(version));
 }
 
 static uint32_t div_frac(uint32_t dividend, uint32_t divisor)
@@ -2112,46 +2121,48 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 			return 1;
 		vcpu->arch.smbase = data;
 		break;
-	case MSR_KVM_WALL_CLOCK_NEW:
-	case MSR_KVM_WALL_CLOCK:
-		vcpu->kvm->arch.wall_clock = data;
-		kvm_write_wall_clock(vcpu->kvm, data);
-		break;
-	case MSR_KVM_SYSTEM_TIME_NEW:
-	case MSR_KVM_SYSTEM_TIME: {
-		u64 gpa_offset;
-		struct kvm_arch *ka = &vcpu->kvm->arch;
+    case MSR_KVM_WALL_CLOCK_NEW:
+    case MSR_KVM_WALL_CLOCK:
+        // 设置为pvclock_wall_clock的地址
+        vcpu->kvm->arch.wall_clock = data;
+        // 填充wall_clock
+        kvm_write_wall_clock(vcpu->kvm, data);
+        break;
+    case MSR_KVM_SYSTEM_TIME_NEW:
+    case MSR_KVM_SYSTEM_TIME: {
+        u64 gpa_offset;
+        struct kvm_arch *ka = &vcpu->kvm->arch;
 
-		kvmclock_reset(vcpu);
+        kvmclock_reset(vcpu);
 
-		if (vcpu->vcpu_id == 0 && !msr_info->host_initiated) {
-			bool tmp = (msr == MSR_KVM_SYSTEM_TIME);
+        if (vcpu->vcpu_id == 0 && !msr_info->host_initiated) {
+            bool tmp = (msr == MSR_KVM_SYSTEM_TIME);
 
-			if (ka->boot_vcpu_runs_old_kvmclock != tmp)
-				set_bit(KVM_REQ_MASTERCLOCK_UPDATE,
-					&vcpu->requests);
+            if (ka->boot_vcpu_runs_old_kvmclock != tmp)
+                set_bit(KVM_REQ_MASTERCLOCK_UPDATE,
+                    &vcpu->requests);
 
-			ka->boot_vcpu_runs_old_kvmclock = tmp;
-		}
+            ka->boot_vcpu_runs_old_kvmclock = tmp;
+        }
+        // 设置为pvclock_vsyscall_time_info的地址
+        vcpu->arch.time = data;
+        kvm_make_request(KVM_REQ_GLOBAL_CLOCK_UPDATE, vcpu);
 
-		vcpu->arch.time = data;
-		kvm_make_request(KVM_REQ_GLOBAL_CLOCK_UPDATE, vcpu);
+        /* we verify if the enable bit is set... */
+        if (!(data & 1))
+            break;
 
-		/* we verify if the enable bit is set... */
-		if (!(data & 1))
-			break;
+        gpa_offset = data & ~(PAGE_MASK | 1);
 
-		gpa_offset = data & ~(PAGE_MASK | 1);
+        if (kvm_gfn_to_hva_cache_init(vcpu->kvm,
+             &vcpu->arch.pv_time, data & ~1ULL,
+             sizeof(struct pvclock_vcpu_time_info)))
+            vcpu->arch.pv_time_enabled = false;
+        else
+            vcpu->arch.pv_time_enabled = true;
 
-		if (kvm_gfn_to_hva_cache_init(vcpu->kvm,
-		     &vcpu->arch.pv_time, data & ~1ULL,
-		     sizeof(struct pvclock_vcpu_time_info)))
-			vcpu->arch.pv_time_enabled = false;
-		else
-			vcpu->arch.pv_time_enabled = true;
-
-		break;
-	}
+        break;
+    }
 	case MSR_KVM_ASYNC_PF_EN:
 		if (kvm_pv_enable_async_pf(vcpu, data))
 			return 1;
