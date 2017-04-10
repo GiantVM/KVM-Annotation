@@ -205,12 +205,12 @@ struct kvm_mmio_fragment {
 };
 
 struct kvm_vcpu {
-	struct kvm *kvm;
+	struct kvm *kvm;//pointer指向虚拟机对应的kvm结构
 #ifdef CONFIG_PREEMPT_NOTIFIERS
 	struct preempt_notifier preempt_notifier;
 #endif
 	int cpu;
-	int vcpu_id;
+	int vcpu_id;//唯一标示一个vcpu
 	int srcu_idx;
 	int mode;
 	unsigned long requests;
@@ -220,7 +220,7 @@ struct kvm_vcpu {
 	struct list_head blocked_vcpu_list;
 
 	struct mutex mutex;
-	struct kvm_run *run;
+	struct kvm_run *run;//执行虚拟机对应的kvm_run结构
 
 	int fpu_active;
 	int guest_fpu_loaded, guest_xcr0_loaded;
@@ -228,11 +228,11 @@ struct kvm_vcpu {
 	struct swait_queue_head wq;
 	struct pid *pid;
 	int sigset_active;
-	sigset_t sigset;
-	struct kvm_vcpu_stat stat;
+	sigset_t sigset;//信号
+	struct kvm_vcpu_stat stat;//vcpu状态信息
 	unsigned int halt_poll_ns;
 	bool valid_wakeup;
-
+//mmio相关部分
 #ifdef CONFIG_HAS_IOMEM
 	int mmio_needed;
 	int mmio_read_completed;
@@ -264,7 +264,7 @@ struct kvm_vcpu {
 	} spin_loop;
 #endif
 	bool preempted;
-	struct kvm_vcpu_arch arch;
+	struct kvm_vcpu_arch arch;//架构相关部分，包括寄存器，apic，mmu相关的架构
 };
 
 static inline int kvm_vcpu_exiting_guest_mode(struct kvm_vcpu *vcpu)
@@ -372,13 +372,15 @@ struct kvm_memslots {
 };
 
 struct kvm {
-	spinlock_t mmu_lock;
+	spinlock_t mmu_lock;//多cpu，多线程并行要保证mmu调度正确性
 	struct mutex slots_lock;
-	struct mm_struct *mm; /* userspace tied to this vm */
+	struct mm_struct *mm; /* userspace tied to this vm 指向qemu 用户态进程？？*/
+	/*kvm_mem_slots是kvm内存管理相关的主要数据结构，用来表示虚拟机
+	GPA和HPA的映射关系。一个kvm_mem_slot表示一段内存区域(slot)的映射关系，struct kvm_memslots 包含了一个 kvm_mem_slot的数组，对应虚拟机使用的所有的内存区域*/
 	struct kvm_memslots *memslots[KVM_ADDRESS_SPACE_NUM];
-	struct srcu_struct srcu;
+	struct srcu_struct srcu; //
 	struct srcu_struct irq_srcu;
-	struct kvm_vcpu *vcpus[KVM_MAX_VCPUS];
+	struct kvm_vcpu *vcpus[KVM_MAX_VCPUS];//一个vm最大的vcpu数量
 
 	/*
 	 * created_vcpus is protected by kvm->lock, and is incremented
@@ -386,12 +388,15 @@ struct kvm {
 	 * incremented after storing the kvm_vcpu pointer in vcpus,
 	 * and is accessed atomically.
 	 */
-	atomic_t online_vcpus;
-	int created_vcpus;
+	atomic_t online_vcpus;//online cpu 的数量
+	int created_vcpus;//在调用KVM_CREATE_VCPU增加
 	int last_boosted_vcpu;
 	struct list_head vm_list;
 	struct mutex lock;
+		/*
+	虚拟机中包括的IO总线结构体数组，一条总线对应一个kvm_io_bus结构体，如ISA总线、PCI总线*/
 	struct kvm_io_bus *buses[KVM_NR_BUSES];
+	//事件通道相关
 #ifdef CONFIG_HAVE_KVM_EVENTFD
 	struct {
 		spinlock_t        lock;
@@ -401,9 +406,10 @@ struct kvm {
 	} irqfds;
 	struct list_head ioeventfds;
 #endif
+	//虚拟机运行时的状态信息，比如页表，mmu
 	struct kvm_vm_stat stat;
-	struct kvm_arch arch;
-	atomic_t users_count;
+	struct kvm_arch arch;//结构相关的比如 x86
+	atomic_t users_count;//引用计数
 #ifdef KVM_COALESCED_MMIO_PAGE_OFFSET
 	struct kvm_coalesced_mmio_ring *coalesced_mmio_ring;
 	spinlock_t ring_lock;
@@ -422,11 +428,12 @@ struct kvm {
 #endif
 
 #if defined(CONFIG_MMU_NOTIFIER) && defined(KVM_ARCH_WANT_MMU_NOTIFIER)
+	 //mmu通知连
 	struct mmu_notifier mmu_notifier;
 	unsigned long mmu_notifier_seq;
 	long mmu_notifier_count;
 #endif
-	long tlbs_dirty;
+	long tlbs_dirty;//dirty的tlb的数量
 	struct list_head devices;
 	struct dentry *debugfs_dentry;
 	struct kvm_stat_data **debugfs_stat_data;

@@ -1204,9 +1204,7 @@ static void kvm_write_wall_clock(struct kvm *kvm, gpa_t wall_clock)
 
 	kvm_write_guest(kvm, wall_clock, &wc, sizeof(wc));
 
-	version++;
-	kvm_write_guest(kvm, wall_clock, &version, sizeof(version));
-}
+
 
 static uint32_t div_frac(uint32_t dividend, uint32_t divisor)
 {
@@ -1397,7 +1395,9 @@ u64 kvm_scale_tsc(struct kvm_vcpu *vcpu, u64 tsc)
 	return _tsc;
 }
 EXPORT_SYMBOL_GPL(kvm_scale_tsc);
-
+/*
+返回host的tsc值与要比较的vcpu的tsc值的差值
+*/
 static u64 kvm_compute_tsc_offset(struct kvm_vcpu *vcpu, u64 target_tsc)
 {
 	u64 tsc;
@@ -1412,33 +1412,42 @@ u64 kvm_read_l1_tsc(struct kvm_vcpu *vcpu, u64 host_tsc)
 	return kvm_x86_ops->read_l1_tsc(vcpu, kvm_scale_tsc(vcpu, host_tsc));
 }
 EXPORT_SYMBOL_GPL(kvm_read_l1_tsc);
-
+//kvm_arch_vcpu_postcreate 创建完vcpu后，设置vcpu环境 ，要写入tsc值
 void kvm_write_tsc(struct kvm_vcpu *vcpu, struct msr_data *msr)
-{
+{   
 	struct kvm *kvm = vcpu->kvm;
 	u64 offset, ns, elapsed;
 	unsigned long flags;
 	s64 usdiff;
 	bool matched;
 	bool already_matched;
-	u64 data = msr->data;
-
+	u64 data = msr->data;//
+    
 	raw_spin_lock_irqsave(&kvm->arch.tsc_write_lock, flags);
+	/*
+      计算vcpu的tsc和对应的tsc的差值
+	*/
 	offset = kvm_compute_tsc_offset(vcpu, data);
 	ns = get_kernel_ns();
+	/*
+	计算host的时间和vm的时间的差值
+	*/
 	elapsed = ns - kvm->arch.last_tsc_nsec;
 
 	if (vcpu->arch.virtual_tsc_khz) {
 		int faulted = 0;
 
 		/* n.b - signed multiplication and division required */
+		//如果tsc是khz的话，计算vm和host的微妙差距
 		usdiff = data - kvm->arch.last_tsc_write;
 #ifdef CONFIG_X86_64
 		usdiff = (usdiff * 1000) / vcpu->arch.virtual_tsc_khz;
-#else
+#else /*
+ 这一段汇编代码无力
+ */
 		/* do_div() only does unsigned */
 		asm("1: idivl %[divisor]\n"
-		    "2: xor %%edx, %%edx\n"
+		    "2: xor %%edx, %%edx\n" 
 		    "   movl $0, %[faulted]\n"
 		    "3:\n"
 		    ".section .fixup,\"ax\"\n"
@@ -1453,7 +1462,7 @@ void kvm_write_tsc(struct kvm_vcpu *vcpu, struct msr_data *msr)
 
 #endif
 		do_div(elapsed, 1000);
-		usdiff -= elapsed;
+		usdiff -= elapsed;//
 		if (usdiff < 0)
 			usdiff = -usdiff;
 
@@ -1467,13 +1476,13 @@ void kvm_write_tsc(struct kvm_vcpu *vcpu, struct msr_data *msr)
 	 * Special case: TSC write with a small delta (1 second) of virtual
 	 * cycle time against real time is interpreted as an attempt to
 	 * synchronize the CPU.
-         *
 	 * For a reliable TSC, we can match TSC offsets, and for an unstable
 	 * TSC, we add elapsed time in this computation.  We could let the
 	 * compensation code attempt to catch up if we fall behind, but
 	 * it's better to try to match offsets from the beginning.
          */
-	if (usdiff < USEC_PER_SEC &&
+
+	if (usdiff < USEC_PER_SEC && 
 	    vcpu->arch.virtual_tsc_khz == kvm->arch.last_tsc_khz) {
 		if (!check_tsc_unstable()) {
 			offset = kvm->arch.cur_tsc_offset;
@@ -1493,7 +1502,6 @@ void kvm_write_tsc(struct kvm_vcpu *vcpu, struct msr_data *msr)
 		 * nanosecond time, offset, and write, so if TSCs are in
 		 * sync, we can match exact offset, and if not, we can match
 		 * exact software computation in compute_guest_tsc()
-		 *
 		 * These values are tracked in kvm->arch.cur_xxx variables.
 		 */
 		kvm->arch.cur_tsc_generation++;
@@ -2716,7 +2724,7 @@ static inline void kvm_migrate_timers(struct kvm_vcpu *vcpu)
 {
 	set_bit(KVM_REQ_MIGRATE_TIMER, &vcpu->requests);
 }
-
+//
 void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
 {
 	/* Address WBINVD may be executed by guest */
@@ -2728,7 +2736,7 @@ void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
 					wbinvd_ipi, NULL, 1);
 	}
 
-	kvm_x86_ops->vcpu_load(vcpu, cpu);
+	kvm_x86_ops->vcpu_load(vcpu, cpu);//调用vmc.vcpu.load()
 
 	/* Apply any externally detected TSC adjustments (due to suspend) */
 	if (unlikely(vcpu->arch.tsc_offset_adjustment)) {
@@ -7379,49 +7387,62 @@ void kvm_arch_vcpu_free(struct kvm_vcpu *vcpu)
 	kvm_x86_ops->vcpu_free(vcpu);
 	free_cpumask_var(wbinvd_dirty_mask);
 }
-
+//create a arch-related vcpu
 struct kvm_vcpu *kvm_arch_vcpu_create(struct kvm *kvm,
 						unsigned int id)
 {
 	struct kvm_vcpu *vcpu;
-
+   // check whether or not the tsc clock is stable。Stable Tsc ensures vms with 
+ //multipe vcpus get synced tsc.
 	if (check_tsc_unstable() && atomic_read(&kvm->online_vcpus) != 0)
 		printk_once(KERN_WARNING
 		"kvm: SMP vm created on host with unstable TSC; "
 		"guest TSC will not be reliable\n");
-
-	vcpu = kvm_x86_ops->vcpu_create(kvm, id);
+ //
+	vcpu = kvm_x86_ops->vcpu_create(kvm, id);//针对vmx来说，是调用vmx_create_vcpu()
 
 	return vcpu;
 }
+/*
 
+*/
 int kvm_arch_vcpu_setup(struct kvm_vcpu *vcpu)
 {
 	int r;
-
-	kvm_vcpu_mtrr_init(vcpu);
-	r = vcpu_load(vcpu);
+    /*
+    mtrr是存储区域类型寄存器，这种机制其实就是确定在系统内存中物理一段内存的类型
+    初始化vcpu的mtrr寄存器
+    */
+	kvm_vcpu_mtrr_init(vcpu);//
+	/*最后调用kvm_arch_vcpu_load();
+	KVM虚拟机VCPU数据结构载入物理CPU
+	*/
+	r = vcpu_load(vcpu);/
 	if (r)
 		return r;
-	kvm_vcpu_reset(vcpu, false);
-	kvm_mmu_setup(vcpu);
-	vcpu_put(vcpu);
+	kvm_vcpu_reset(vcpu, false);//vcpu重置，包括相关寄存器、时钟、pmu等，最终调用vmx_vcpu_reset
+	 /*
+     * 进行虚拟机mmu相关设置，比如进行ept页表的相关初始工作或影子页表
+     * 相关的设置。
+     */
+	kvm_mmu_setup(vcpu);//根据情况初始化不一样的mmu，
+	vcpu_put(vcpu);//销毁vcpu，free相关资源
 	return r;
 }
 
 void kvm_arch_vcpu_postcreate(struct kvm_vcpu *vcpu)
 {
-	struct msr_data msr;
+	struct msr_data msr;//
 	struct kvm *kvm = vcpu->kvm;
 
 	if (vcpu_load(vcpu))
 		return;
 	msr.data = 0x0;
-	msr.index = MSR_IA32_TSC;
-	msr.host_initiated = true;
-	kvm_write_tsc(vcpu, &msr);
+	msr.index = MSR_IA32_TSC;//#define MSR_IA32_TSC			0x00000010
+	msr.host_initiated = true;//创建完vcpu要同步vcpu的tsc
+	kvm_write_tsc(vcpu, &msr);//
 	vcpu_put(vcpu);
-
+    //kvm时钟是否是定期同步的
 	if (!kvmclock_periodic_sync)
 		return;
 
@@ -8288,7 +8309,7 @@ static void kvm_del_async_pf_gfn(struct kvm_vcpu *vcpu, gfn_t gfn)
 static int apf_put_user(struct kvm_vcpu *vcpu, u32 val)
 {
 
-	return kvm_write_guest_cached(vcpu->kvm, &vcpu->arch.apf.data, &val,
+	ret21urn kvm_write_guest_cached(vcpu->kvm, &vcpu->arch.apf.data, &val,
 				      sizeof(val));
 }
 

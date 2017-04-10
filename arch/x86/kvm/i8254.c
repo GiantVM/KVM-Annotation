@@ -235,7 +235,7 @@ static void destroy_pit_timer(struct kvm_pit *pit)
 	hrtimer_cancel(&pit->pit_state.timer);
 	flush_kthread_work(&pit->expired);
 }
-
+//
 static void pit_do_work(struct kthread_work *work)
 {
 	struct kvm_pit *pit = container_of(work, struct kvm_pit, expired);
@@ -246,7 +246,7 @@ static void pit_do_work(struct kthread_work *work)
 
 	if (atomic_read(&ps->reinject) && !atomic_xchg(&ps->irq_ack, 0))
 		return;
-
+    //模拟高低电平触发时钟终端
 	kvm_set_irq(kvm, pit->irq_source_id, 0, 1, false);
 	kvm_set_irq(kvm, pit->irq_source_id, 0, 0, false);
 
@@ -265,15 +265,18 @@ static void pit_do_work(struct kthread_work *work)
 }
 
 static enum hrtimer_restart pit_timer_fn(struct hrtimer *data)
-{
+{   
+
 	struct kvm_kpit_state *ps = container_of(data, struct kvm_kpit_state, timer);
 	struct kvm_pit *pt = pit_state_to_pit(ps);
-
+     /*
+     如果时钟终端需要重新注入，就累加
+     */
 	if (atomic_read(&ps->reinject))
 		atomic_inc(&ps->pending);
-
+    
 	queue_kthread_work(&pt->worker, &pt->expired);
-
+    //如果定时器是周期性触发的，则再次启动定时器
 	if (ps->is_periodic) {
 		hrtimer_add_expires_ns(&ps->timer, ps->period);
 		return HRTIMER_RESTART;
@@ -307,7 +310,7 @@ void kvm_pit_set_reinject(struct kvm_pit *pit, bool reinject)
 
 	atomic_set(&ps->reinject, reinject);
 }
-
+//创建pit定时器
 static void create_pit_timer(struct kvm_pit *pit, u32 val, int is_period)
 {
 	struct kvm_kpit_state *ps = &pit->pit_state;
@@ -317,13 +320,13 @@ static void create_pit_timer(struct kvm_pit *pit, u32 val, int is_period)
 	if (!ioapic_in_kernel(kvm) ||
 	    ps->flags & KVM_PIT_FLAGS_HPET_LEGACY)
 		return;
-
+    //根据传入的val设置定时器的interval
 	interval = mul_u64_u32_div(val, NSEC_PER_SEC, KVM_PIT_FREQ);
 
 	pr_debug("create pit timer, interval is %llu nsec\n", interval);
 
 	/* TODO The new value only affected after the retriggered */
-	hrtimer_cancel(&ps->timer);
+	hrtimer_cancel(&ps->timer);//取消之前的定时器
 	flush_kthread_work(&pit->expired);
 	ps->period = interval;
 	ps->is_periodic = is_period;
@@ -335,6 +338,7 @@ static void create_pit_timer(struct kvm_pit *pit, u32 val, int is_period)
 	 * interval, since the hrtimers are not throttled by the host
 	 * scheduler.
 	 */
+	// 不允许设置interval小于min_period的periodic定时器，这样回增加系统开销
 	if (ps->is_periodic) {
 		s64 min_period = min_timer_period_us * 1000LL;
 
@@ -346,7 +350,7 @@ static void create_pit_timer(struct kvm_pit *pit, u32 val, int is_period)
 			ps->period = min_period;
 		}
 	}
-
+    //创建高精度定时器
 	hrtimer_start(&ps->timer, ktime_add_ns(ktime_get(), interval),
 		      HRTIMER_MODE_ABS);
 }
@@ -652,24 +656,26 @@ struct kvm_pit *kvm_create_pit(struct kvm *kvm, u32 flags)
 	struct pid *pid;
 	pid_t pid_nr;
 	int ret;
+    //分配内存空间
 
 	pit = kzalloc(sizeof(struct kvm_pit), GFP_KERNEL);
 	if (!pit)
 		return NULL;
-
+    //初始化中断源的id
 	pit->irq_source_id = kvm_request_irq_source_id(kvm);
 	if (pit->irq_source_id < 0)
 		goto fail_request;
 
 	mutex_init(&pit->pit_state.lock);
-
+    //
 	pid = get_pid(task_tgid(current));
 	pid_nr = pid_vnr(pid);
 	put_pid(pid);
 
-	init_kthread_worker(&pit->worker);
+	init_kthread_worker(&pit->worker);//初始化内核线程
+	// 建立内核线程,pit->worker_task是task_struct 结构体类型，用来保存进程描述符信息
 	pit->worker_task = kthread_run(kthread_worker_fn, &pit->worker,
-				       "kvm-pit/%d", pid_nr);
+				       "kvm-pit/%d", pid_nr);//kthread_run()创建内核进程，linux函数
 	if (IS_ERR(pit->worker_task))
 		goto fail_kthread;
 
@@ -678,19 +684,20 @@ struct kvm_pit *kvm_create_pit(struct kvm *kvm, u32 flags)
 	pit->kvm = kvm;
 
 	pit_state = &pit->pit_state;
+	/*  --引用 *初始化一个高精准定时器，这个定时器就作为我们虚拟时钟的时钟源，然而定期是的物理时钟源根据不同的硬件而不同*/
 	hrtimer_init(&pit_state->timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
 	pit_state->timer.function = pit_timer_fn;
 
 	pit_state->irq_ack_notifier.gsi = 0;
-	pit_state->irq_ack_notifier.irq_acked = kvm_pit_ack_irq;
+	pit_state->irq_ack_notifier.irq_acked = kvm_pit_ack_irq;//时钟终端模拟ack
 	pit->mask_notifier.func = pit_mask_notifer;
 
-	kvm_pit_reset(pit);
+	kvm_pit_reset(pit);//把pit.pit_state初始化,比如
 
-	kvm_pit_set_reinject(pit, true);
+	kvm_pit_set_reinject(pit, true);//重新注入时钟终端？？？
 
 	mutex_lock(&kvm->slots_lock);
-	kvm_iodevice_init(&pit->dev, &pit_dev_ops);
+	kvm_iodevice_init(&pit->dev, &pit_dev_ops);//初始化io虚拟化操作
 	ret = kvm_io_bus_register_dev(kvm, KVM_PIO_BUS, KVM_PIT_BASE_ADDRESS,
 				      KVM_PIT_MEM_LENGTH, &pit->dev);
 	if (ret < 0)
