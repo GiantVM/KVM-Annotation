@@ -142,6 +142,7 @@ struct kvm_shared_msrs_global {
 	u32 msrs[KVM_NR_SHARED_MSRS];
 };
 
+// 每个Host Core上的vCPU共享这些MSR
 struct kvm_shared_msrs {
 	struct user_return_notifier urn;
 	bool registered;
@@ -193,6 +194,7 @@ struct kvm_stats_debugfs_item debugfs_entries[] = {
 	{ NULL }
 };
 
+// 用于控制XSAVE系列指令的行为，XSAVE系列指令包括XSAVE、XRSTOR等用于存取浮点数的指令
 u64 __read_mostly host_xcr0;
 
 static int emulator_fix_hypercall(struct x86_emulate_ctxt *ctxt);

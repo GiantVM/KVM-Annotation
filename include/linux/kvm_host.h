@@ -378,6 +378,9 @@ struct kvm {
 	struct kvm_memslots *memslots[KVM_ADDRESS_SPACE_NUM];
 	struct srcu_struct srcu;
 	struct srcu_struct irq_srcu;
+	// `KVM_MAX_VCPUS`是最大允许的vCPU数目，用户态可以通过`KVM_CAP_MAX_VCPUS`查询
+	// `KVM_SOFT_MAX_VCPUS`是推荐的最大vCPU数目，用户态可以通过`KVM_CAP_NR_VCPUS`查询
+	// `KVM_MAX_VCPU_ID`是vCPU ID的最大允许值，用户态可以通过`KVM_CAP_MAX_VCPU_ID`查询
 	struct kvm_vcpu *vcpus[KVM_MAX_VCPUS];
 
 	/*

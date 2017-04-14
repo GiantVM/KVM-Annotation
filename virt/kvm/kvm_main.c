@@ -16,7 +16,6 @@
  *
  */
 
-
 #include <kvm/iodev.h>
 
 #include <linux/kvm_host.h>
@@ -89,13 +88,18 @@ module_param(halt_poll_ns_shrink, uint, S_IRUGO | S_IWUSR);
  */
 
 DEFINE_SPINLOCK(kvm_lock);
+// raw spinlock就是通常所说的spin lock，采用原子指令实现
+// spinlock则是在non-realtime的kernel中与raw spinlock相同，而在realtime的kernel中
+// 改为sleepable的实现
 static DEFINE_RAW_SPINLOCK(kvm_count_lock);
+// 被kvm_lock保护，该链表用于遍历所有vm实例的`struct kvm`
 LIST_HEAD(vm_list);
 
-static cpumask_var_t cpus_hardware_enabled;
-static int kvm_usage_count;
+static cpumask_var_t cpus_hardware_enabled; // 记录当前哪些Host core启用了KVM
+static int kvm_usage_count;                 // 记录当前启用了KVM的core数
 static atomic_t hardware_enable_failed;
 
+// slab内存池，用于创建和销毁`struct kvm_vcpu`
 struct kmem_cache *kvm_vcpu_cache;
 EXPORT_SYMBOL_GPL(kvm_vcpu_cache);
 
@@ -2400,39 +2404,37 @@ static int create_vcpu_fd(struct kvm_vcpu *vcpu)
 /*
  * Creates some virtual cpus.  Good luck creating more than one.
  */
- /*创建一些vcpu，为虚拟机创建vcpu的ioctl调用的入口函数，创建vcpu结构并且初始化，并且将其填入kvm的结构.*/
 
 static int kvm_vm_ioctl_create_vcpu(struct kvm *kvm, u32 id)
 {
 	int r;
-	struct kvm_vcpu *vcpu;//定义一个vcpu pointer
+	struct kvm_vcpu *vcpu;
 
 	if (id >= KVM_MAX_VCPU_ID)
-		return -EINVAL;//id已经超过了定义的最大的vcpu，id的话，返回失败
+		return -EINVAL;
 
 	mutex_lock(&kvm->lock);
-	//如果创建的vcpu数量已经超过了KVM_MAX_VCPUS定义的最大的数量
 	if (kvm->created_vcpus == KVM_MAX_VCPUS) {
 		mutex_unlock(&kvm->lock);
 		return -EINVAL;
 	}
 
-	kvm->created_vcpus++;//kvm结构体中追踪创建的vcpu数量的create_vcpus加一
+	kvm->created_vcpus++;
 	mutex_unlock(&kvm->lock);
 
-	vcpu = kvm_arch_vcpu_create(kvm, id);//创建vcpu结构，对于intel x86最终调用vmx_create_vcpu
+	vcpu = kvm_arch_vcpu_create(kvm, id); // 调用到`kvm_x86_ops->vcpu_create`，Intel架构即`vmx_create_vcpu`
 	if (IS_ERR(vcpu)) {
 		r = PTR_ERR(vcpu);
-		goto vcpu_decrement;//vcpu创建失败
+		goto vcpu_decrement;
 	}
 
 	preempt_notifier_init(&vcpu->preempt_notifier, &kvm_preempt_ops);
- /*
-     * 设置vcpu结构，主要调用kvm_x86_ops->vcpu_load，KVM虚拟机VCPU数据结构载入物理CPU，
-     * 并进行虚拟机mmu相关设置，比如进行ept页表的相关初始工作或影子页表
-     * 相关的设置。
-     */
 
+	/*
+	 * 设置vcpu结构，主要调用kvm_x86_ops->vcpu_load，KVM虚拟机VCPU数据结构载入物理CPU，
+	 * 并进行虚拟机mmu相关设置，比如进行ept的相关初始工作或shadow page table
+	 * 相关的设置。
+	 */
 	r = kvm_arch_vcpu_setup(vcpu);
 	if (r)
 		goto vcpu_destroy;
@@ -2442,33 +2444,31 @@ static int kvm_vm_ioctl_create_vcpu(struct kvm *kvm, u32 id)
 		r = -EEXIST;
 		goto unlock_vcpu_destroy;
 	}
-    /*
-     * kvm->vcpus[]数组包括该vm的所有vcpu，定义为KVM_MAX_VCPUS大小的数组。
-     * 在kvm结构初始化时，其中所有成员都初始化为0，在vcpu还没有
-     * 分配之前，如果不为0，那就是bug了。
-     */
 
+	// 为何要放一个assertion？曾经出过bug？
 	BUG_ON(kvm->vcpus[atomic_read(&kvm->online_vcpus)]);
 
 	/* Now it's all set up, let userspace reach it */
-	kvm_get_kvm(kvm);
-	r = create_vcpu_fd(vcpu);// 为新创建的vcpu创建对应的fd，以便于后续通过该fd进行ioctl操作
+	kvm_get_kvm(kvm); // `struct kvm_vcpu`是引用计数的，用`kvm_get/put_kvm`加减引用计数
+	r = create_vcpu_fd(vcpu); // 此处直接调用`anon_inode_getfd`创建了fd，但创建vm file时这一步分作了三步进行
 	if (r < 0) {
-		kvm_put_kvm(kvm);//fd创建不成功，free 一个vm
+		kvm_put_kvm(kvm);
 		goto unlock_vcpu_destroy;
 	}
 
-	kvm->vcpus[atomic_read(&kvm->online_vcpus)] = vcpu;[]数组中
+	kvm->vcpus[atomic_read(&kvm->online_vcpus)] = vcpu;
 
 	/*
 	 * Pairs with smp_rmb() in kvm_get_vcpu.  Write kvm->vcpus
 	 * before kvm->online_vcpu's incremented value.
+	 *
+	 * 在x86的TSO memory model下无需write barrier，若是weak consistency model的架构则需要write barrier保证其它核看到的顺序是vcpu创建完毕后再加一
 	 */
 	smp_wmb();
-	atomic_inc(&kvm->online_vcpus);//原子性增加online_vcpus的数量
+	atomic_inc(&kvm->online_vcpus);
 
 	mutex_unlock(&kvm->lock);
-	kvm_arch_vcpu_postcreate(vcpu);// 架构相关的善后工作，比如再次调用vcpu_load，以及tsc相关处理
+	kvm_arch_vcpu_postcreate(vcpu); // 架构相关的善后工作，比如再次调用`vcpu_load`，以及tsc相关处理
 	return r;
 
 unlock_vcpu_destroy:
@@ -2477,7 +2477,7 @@ vcpu_destroy:
 	kvm_arch_vcpu_destroy(vcpu);
 vcpu_decrement:
 	mutex_lock(&kvm->lock);
-	kvm->created_vcpus--;//减少created_vcpus的数量
+	kvm->created_vcpus--;
 	mutex_unlock(&kvm->lock);
 	return r;
 }
@@ -3151,6 +3151,9 @@ static int kvm_dev_ioctl_create_vm(unsigned long type)
 		return r;
 	}
 #endif
+	// 分三步进行，第一步获取空闲fd，第二步创建`struct file`，第三步创建向fdtable注册
+	// `struct kvm`被储存在`file->private_data`中
+	// 分三步似乎是为了进行`kvm_create_vm_debugfs`，在创建vcpu file时是直接一步完成的
 	r = get_unused_fd_flags(O_CLOEXEC);
 	if (r < 0) {
 		kvm_put_kvm(kvm);
@@ -3854,8 +3857,9 @@ int kvm_init(void *opaque, unsigned vcpu_size, unsigned vcpu_align,
 				      kvm_starting_cpu, kvm_dying_cpu);
 	if (r)
 		goto out_free_2;
-	register_reboot_notifier(&kvm_reboot_notifier);
+	register_reboot_notifier(&kvm_reboot_notifier); // reboot前令所有core都退出VMX operation
 
+	// 申请slab内存池，以使`struct kvm_vcpu`创建和销毁更快
 	/* A kmem cache lets us meet the alignment requirements of fx_save. */
 	if (!vcpu_align)
 		vcpu_align = __alignof__(struct kvm_vcpu);
@@ -3880,6 +3884,8 @@ int kvm_init(void *opaque, unsigned vcpu_size, unsigned vcpu_align,
 		goto out_unreg;
 	}
 
+	// 设置机器suspend和resume时的callback，使得机器在休眠前退出VMX Operation，唤醒后返回VMX Operation
+	// 注册到syscore中的suspend，会在普通驱动的suspend操作之后进行，反之，resume会在普通驱动的resume操作之前进行
 	register_syscore_ops(&kvm_syscore_ops);
 
 	kvm_preempt_ops.sched_in = kvm_sched_in;

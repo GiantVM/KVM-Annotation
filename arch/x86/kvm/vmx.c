@@ -541,6 +541,12 @@ struct vcpu_vmx {
 	u32                   exit_intr_info;
 	u32                   idt_vectoring_info;
 	ulong                 rflags;
+	/* 具体包括哪些MSR可见`vmx_msr_index`，列举如下
+	 * x64: MSR_SYSCALL_MASK, MSR_LSTAR, MSR_CSTAR
+	 * x86: MSR_EFER, MSR_TSC_AUX, MSR_STAR
+	 * MSR_EFER (Extended Feature Enable，用于开启64位模式、NX功能等)会被自动保存和恢复，存在此处仅用于判断Guest所处模式
+	 * 其它都是用于SYSCALL/SYSRET指令的MSR，由于不会被自动保存，需要手动保存guest MSR状态
+	 */
 	struct shared_msr_entry *guest_msrs;
 	int                   nmsrs;
 	int                   save_nmsrs;
