@@ -42,11 +42,11 @@
 #define MSR_KVM_PV_EOI_EN      0x4b564d04
 
 struct kvm_steal_time {
-	__u64 steal;
-	__u32 version;
-	__u32 flags;
-	__u32 pad[12];
-};
+    __u64 steal;                // 当前vCPU没有运行的时间(ns)，在vCPU空闲时不计算
+    __u32 version;              // 版本号，奇数表示正在更新
+    __u32 flags;                // 目前为0
+    __u32 pad[12];
+}
 
 #define KVM_STEAL_ALIGNMENT_BITS 5
 #define KVM_STEAL_VALID_BITS ((-1ULL << (KVM_STEAL_ALIGNMENT_BITS + 1)))

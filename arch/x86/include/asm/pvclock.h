@@ -89,10 +89,14 @@ static inline u64 pvclock_scale_delta(u64 delta, u32 mul_frac, int shift)
 static __always_inline
 cycle_t __pvclock_read_cycles(const struct pvclock_vcpu_time_info *src)
 {
-	u64 delta = rdtsc_ordered() - src->tsc_timestamp;
-	cycle_t offset = pvclock_scale_delta(delta, src->tsc_to_system_mul,
-					     src->tsc_shift);
-	return src->system_time + offset;
+    // 修正system_time
+    // 先读取当前的tsc，减去host写system_time时的tsc，得到过去的时间
+    u64 delta = rdtsc_ordered() - src->tsc_timestamp;
+    // 需要进行左移，然后乘上倍数
+    cycle_t offset = pvclock_scale_delta(delta, src->tsc_to_system_mul,
+                         src->tsc_shift);
+    // 然后加回到system_time
+    return src->system_time + offset;
 }
 
 struct pvclock_vsyscall_time_info {
