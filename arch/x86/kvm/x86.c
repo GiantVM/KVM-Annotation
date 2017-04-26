@@ -152,8 +152,8 @@ struct kvm_shared_msrs {
 	} values[KVM_NR_SHARED_MSRS];
 };
 
-static struct kvm_shared_msrs_global __read_mostly shared_msrs_global;
-static struct kvm_shared_msrs __percpu *shared_msrs;
+static struct kvm_shared_msrs_global __read_mostly shared_msrs_global; // 所有vCPU都共享这些MSR
+static struct kvm_shared_msrs __percpu *shared_msrs;  // 每个Core上的vCPU共享这些MSR
 
 struct kvm_stats_debugfs_item debugfs_entries[] = {
 	{ "pf_fixed", VCPU_STAT(pf_fixed) },
@@ -1261,6 +1261,7 @@ static atomic_t kvm_guest_has_master_clock = ATOMIC_INIT(0);
 #endif
 
 static DEFINE_PER_CPU(unsigned long, cpu_tsc_khz);
+// 如果Host支持constant TSC，则为TSC的频率，否则为cpufreq所设置的policy规定的最高睿频
 static unsigned long max_tsc_khz;
 
 static u32 adjust_tsc_khz(u32 khz, s32 ppm)
@@ -5730,6 +5731,7 @@ static void kvm_timer_init(void)
 
 	if (!boot_cpu_has(X86_FEATURE_CONSTANT_TSC)) {
 #ifdef CONFIG_CPU_FREQ
+		// 若Host不支持constant TSC，则取当前policy下的最高睿频频率为max_tsc_khz
 		struct cpufreq_policy policy;
 		memset(&policy, 0, sizeof(policy));
 		cpu = get_cpu();
@@ -5738,6 +5740,7 @@ static void kvm_timer_init(void)
 			max_tsc_khz = policy.cpuinfo.max_freq;
 		put_cpu();
 #endif
+		// 该notifier在CPU频率变化时被调用两次，一次在变化前，一次在变化后
 		cpufreq_register_notifier(&kvmclock_cpufreq_notifier_block,
 					  CPUFREQ_TRANSITION_NOTIFIER);
 	}
@@ -5842,6 +5845,9 @@ static DECLARE_WORK(pvclock_gtod_work, pvclock_gtod_update_fn);
 
 /*
  * Notification about pvclock gtod data update.
+ * 当Host要通过timekeeper更新时间时（即Host要调用`timekeeping_update`时，这通常发生在tick时，
+ * 也可能发生在更换clocksource等场合），会调用该notifier。
+ * 第二个参数代表timekeeper是否更换了clocksource，第三个参数即Host的timekeeper
  */
 static int pvclock_gtod_notify(struct notifier_block *nb, unsigned long unused,
 			       void *priv)

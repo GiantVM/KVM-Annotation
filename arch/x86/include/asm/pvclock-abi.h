@@ -23,23 +23,27 @@
  */
 
 struct pvclock_vcpu_time_info {
-    u32   version;              // 同pvclock_wall_clock，检验数据可用性
-    u32   pad0;
-    u64   tsc_timestamp;        // 为guest设置的tsc(rdtsc + tsc_offset)。在kvm_guest_time_update中会和system_time一起被更新，表示记录system_time时的时间戳
-                                // 但指令间还是有时间差，可以计算delta然后加到system_time
-    u64   system_time;          // 最近一次从host读到的时间，作为guest的墙上时间。host通过ktime_get_ts从当前注册的时间源获取该时间
-                                // system_time = kernel_ns + v->kvm->arch.kvmclock_offset
-                                // 系统启动后的时间减去VM init的时间，即VM init后到现在的时间
-    u32   tsc_to_system_mul;    // 时钟频率，1nanosecond对应的cycle数(固定在1GHZ)
-    s8    tsc_shift;            // guests must shift
-    u8    flags;
-    u8    pad[2];
+	// 奇数表示hypervisor正在修改，偶数表示可用
+	u32   version;
+	u32   pad0;
+	// host最后一次更新时，guest的tsc value，即在guest内rdtsc应该得到的值，
+	// 相当于host的tsc value + tsc offset（若不考虑tsc scaling）
+	u64   tsc_timestamp;
+	// host最后一次更新时，host的时间，在kvm中使用的是boot time（这是单调增的，单位是ns），
+	// 并且可以再加上一个用户指定的offset
+	u64   system_time;
+	// 下面两个field用于将tsc值转换为ns，公式为 ns = ((tsc << tsc_shift) * tsc_to_system_mul) >> 32
+	u32   tsc_to_system_mul;
+	s8    tsc_shift;
+	u8    flags;
+	u8    pad[2];
 } __attribute__((__packed__)); /* 32 bytes */
 
 struct pvclock_wall_clock {
-    u32   version;               // 检验数据可用性
-    u32   sec;
-    u32   nsec;
+	// 奇数表示hypervisor正在修改，偶数表示可用
+	u32   version;
+	u32   sec;
+	u32   nsec;
 } __attribute__((__packed__));
 
 #define PVCLOCK_TSC_STABLE_BIT	(1 << 0)

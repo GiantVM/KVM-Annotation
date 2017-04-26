@@ -92,11 +92,10 @@ DEFINE_SPINLOCK(kvm_lock);
 // spinlock则是在non-realtime的kernel中与raw spinlock相同，而在realtime的kernel中
 // 改为sleepable的实现
 static DEFINE_RAW_SPINLOCK(kvm_count_lock);
-// 被kvm_lock保护，该链表用于遍历所有vm实例的`struct kvm`
-LIST_HEAD(vm_list);
+LIST_HEAD(vm_list); // 被kvm_lock保护，该链表用于遍历所有vm实例的`struct kvm`
 
-static cpumask_var_t cpus_hardware_enabled; // 记录当前哪些Host core启用了KVM
-static int kvm_usage_count;                 // 记录当前启用了KVM的core数
+static cpumask_var_t cpus_hardware_enabled; // 记录当前哪些Host core开启了VMX扩展
+static int kvm_usage_count;                 // 记录当前开启了几个VM（即struct kvm）
 static atomic_t hardware_enable_failed;
 
 // slab内存池，用于创建和销毁`struct kvm_vcpu`
@@ -143,20 +142,17 @@ bool kvm_is_reserved_pfn(kvm_pfn_t pfn)
  */
 int vcpu_load(struct kvm_vcpu *vcpu)
 {
-    int cpu;
+	int cpu;
 
-    if (mutex_lock_killable(&vcpu->mutex))
-        return -EINTR;
-    // 关闭抢占
-    cpu = get_cpu();
-    // 注册preempt notifier，当发生内核抢占时会调用回调函数进行处理 kvm_sched_in (被调度之前)和 kvm_sched_out (被抢占之后)
-    // 这样比每次执行修改VMCS都要关闭抢占性能好
-    preempt_notifier_register(&vcpu->preempt_notifier);
-    // 将vCPU绑定的pCPU上
-    kvm_arch_vcpu_load(vcpu, cpu);
-    // 重新打开抢占
-    put_cpu();
-    return 0;
+	if (mutex_lock_killable(&vcpu->mutex))
+		return -EINTR;
+	cpu = get_cpu(); // 关闭抢占
+	// kvm内核模块可能被抢占，并迁移到其他核上执行，注册的notifier在被抢占后执行kvm_sched_out，
+	// 被重新调度前执行kvm_sched_in，以保证迁移后还能顺利启动当前正在操作的vm
+	preempt_notifier_register(&vcpu->preempt_notifier);
+	kvm_arch_vcpu_load(vcpu, cpu);
+	vput_cpu();       // 打开抢占
+	return 0;
 }
 EXPORT_SYMBOL_GPL(vcpu_load);
 
@@ -662,6 +658,8 @@ static struct kvm *kvm_create_vm(unsigned long type)
 			goto out_err;
 	}
 
+	// 注册mmu notifier，当Host要对page table进行改动时调用回调，对Guest进行相应的改动，
+	// 以保证Guest所见到的page table和Host一致
 	r = kvm_init_mmu_notifier(kvm);
 	if (r)
 		goto out_err;
@@ -3247,6 +3245,7 @@ static void hardware_enable_nolock(void *junk)
 	}
 }
 
+// 热插入一个CPU，如果现在有VM在运行，该CPU也必须开启VMX扩展
 static int kvm_starting_cpu(unsigned int cpu)
 {
 	raw_spin_lock(&kvm_count_lock);
@@ -3266,6 +3265,7 @@ static void hardware_disable_nolock(void *junk)
 	kvm_arch_hardware_disable();
 }
 
+// 热拔出一个CPU，如果现在有VM在运行，该CPU必须对active VMCS进行VMCLEAR，并关闭VMX扩展
 static int kvm_dying_cpu(unsigned int cpu)
 {
 	raw_spin_lock(&kvm_count_lock);
@@ -3284,6 +3284,9 @@ static void hardware_disable_all_nolock(void)
 		on_each_cpu(hardware_disable_nolock, NULL, 1);
 }
 
+// VMX扩展这项资源是被当前启动的VM数引用计数的，用`hardware_enable_all`和`hardware_disable_all`
+// 分别对计数加一减一，计数从零到一时创建该资源（启用VMX扩展，在各CPU上创建active VMCS链表等），
+// 计数从一到零时销毁该资源（在各CPU上VMCLEAR VMCS，关闭VMX扩展等）
 static void hardware_disable_all(void)
 {
 	raw_spin_lock(&kvm_count_lock);
@@ -3845,6 +3848,7 @@ int kvm_init(void *opaque, unsigned vcpu_size, unsigned vcpu_align,
 	if (r < 0)
 		goto out_free_0a;
 
+	// 判断各个CPU之间配置是否不一致（例如CPU0和CPU1的revision id不一致），不一致则初始化失败
 	for_each_online_cpu(cpu) {
 		smp_call_function_single(cpu,
 				kvm_arch_check_processor_compat,
@@ -3853,11 +3857,12 @@ int kvm_init(void *opaque, unsigned vcpu_size, unsigned vcpu_align,
 			goto out_free_1;
 	}
 
+	// 注册热插拔CPU时的回调
 	r = cpuhp_setup_state_nocalls(CPUHP_AP_KVM_STARTING, "AP_KVM_STARTING",
 				      kvm_starting_cpu, kvm_dying_cpu);
 	if (r)
 		goto out_free_2;
-	register_reboot_notifier(&kvm_reboot_notifier); // reboot前令所有core都退出VMX operation
+	register_reboot_notifier(&kvm_reboot_notifier); // reboot前所有core都应退出VMX operation
 
 	// 申请slab内存池，以使`struct kvm_vcpu`创建和销毁更快
 	/* A kmem cache lets us meet the alignment requirements of fx_save. */

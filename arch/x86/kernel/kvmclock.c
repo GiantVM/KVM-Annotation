@@ -55,7 +55,6 @@ struct pvclock_vsyscall_time_info *pvclock_pvti_cpu0_va(void)
  * have elapsed since the hypervisor wrote the data. So we try to account for
  * that with system time
  */
-// 获取VM的启动时间
 static void kvm_get_wallclock(struct timespec *now)
 {
 	struct pvclock_vcpu_time_info *vcpu_time;
@@ -65,13 +64,13 @@ static void kvm_get_wallclock(struct timespec *now)
 	low = (int)__pa_symbol(&wall_clock);
 	high = ((u64)__pa_symbol(&wall_clock) >> 32);
 
-	// 将wall_clock的gpa写入VMCS中，以告知VMM去写
+	// 将wall_clock的物理地址通过MSR注册到kvm中
 	native_write_msr(msr_kvm_wall_clock, low, high);
 
 	cpu = get_cpu();
-	// 获取VM过去的时间
 	vcpu_time = &hv_clock[cpu].pvti;
-	// VMM写后，加上VM过去的时间，得到VM此时的当前时间，保存到now中
+	// 将kvm提供的guest在boot时的wall clock加上guest的boot time，
+	// 得到当前的wall clock，写入now中
 	pvclock_read_wallclock(&wall_clock, vcpu_time, now);
 
 	put_cpu();
@@ -82,6 +81,9 @@ static int kvm_set_wallclock(const struct timespec *now)
 	return -1;
 }
 
+// 读取当前的ns数，读到的值总是单调增的，即使pvclock是unstable的
+// 如果pvclock是unstable的，则会用一个last_value记录上次读到的值，如果此次读到的值
+// 比last_value还小（时间跳回了过去），则返回last_value
 static cycle_t kvm_clock_read(void)
 {
 	struct pvclock_vcpu_time_info *src;
@@ -91,7 +93,6 @@ static cycle_t kvm_clock_read(void)
 	preempt_disable_notrace();
 	cpu = smp_processor_id();
 	src = &hv_clock[cpu].pvti;
-	// 读取时间源，根据hv_clock[cpu].pvti更新system_time，返回
 	ret = pvclock_clocksource_read(src);
 	preempt_enable_notrace();
 	return ret;
@@ -107,13 +108,16 @@ static cycle_t kvm_sched_clock_read(void)
 	return kvm_clock_read() - kvm_sched_clock_offset;
 }
 
+// 将guest的sched_clock替换成kvmclock（默认是TSC）
 static inline void kvm_sched_clock_init(bool stable)
 {
 	if (!stable) {
 		pv_time_ops.sched_clock = kvm_clock_read;
 		return;
 	}
-	// 获取当前的时钟偏移
+
+	// 让sched_clock从零开始计时，从而保证printk timestamps从零开始
+	// 这淘汰了旧的PVCLOCK_COUNTS_FROM_ZERO特性
 	kvm_sched_clock_offset = kvm_clock_read();
 	pv_time_ops.sched_clock = kvm_sched_clock_read;
 	set_sched_clock_stable();
@@ -133,8 +137,9 @@ static inline void kvm_sched_clock_init(bool stable)
  * Any heuristics is subject to fail, because ultimately, a large
  * poll of guests can be running and trouble each other. So we preset
  * lpj here
+ * 直接通过pvclock获取guest的TSC频率，而不是让guest进行calibrate（那样不准确），公式如下
+ * tsc_khz = ((10^6 << 32) / mult) >> shift
  */
-// 将clock转换为hz
 static unsigned long kvm_get_tsc_khz(void)
 {
 	struct pvclock_vcpu_time_info *src;
@@ -148,6 +153,7 @@ static unsigned long kvm_get_tsc_khz(void)
 	return tsc_khz;
 }
 
+// 预设loops_per_jiffiy，免去guest进行calibrate的必要
 static void kvm_get_preset_lpj(void)
 {
 	unsigned long khz;
@@ -182,12 +188,12 @@ bool kvm_check_and_clear_guest_paused(void)
 static struct clocksource kvm_clock = {
 	.name = "kvm-clock",
 	.read = kvm_clock_get_cycles,
-	.rating = 400,
+	.rating = 400, // 将rating设置为400从而比系统中的其他clocksource优先级高，接管系统的时间读取
 	.mask = CLOCKSOURCE_MASK(64),
 	.flags = CLOCK_SOURCE_IS_CONTINUOUS,
 };
 
-// 将pvti的gpa写入到MSR中，以告知VMM
+// 将pvclock_page的物理地址通过MSR注册到kvm中，此后kvm可以通过更新这块内存来告知guest真实时间
 int kvm_register_clock(char *txt)
 {
 	int cpu = smp_processor_id();
@@ -197,7 +203,6 @@ int kvm_register_clock(char *txt)
 	if (!hv_clock)
 		return 0;
 
-    // 获取当前cpu中pvti对应的gpa，写入到MSR_KVM_SYSTEM_TIME/MSR_KVM_SYSTEM_TIME_NEW 中
 	src = &hv_clock[cpu].pvti;
 	low = (int)slow_virt_to_phys(src) | 1;
 	high = ((u64)slow_virt_to_phys(src) >> 32);
@@ -264,7 +269,7 @@ void __init kvmclock_init(void)
 	if (!kvm_para_available())
 		return;
 
-	// 设置使用的MSR
+	// 这两个MSR用于告知kvm是否启用pvclock，以及将pvclock的信息放在guest中的哪个物理页上
 	if (kvmclock && kvm_para_has_feature(KVM_FEATURE_CLOCKSOURCE2)) {
 		msr_kvm_system_time = MSR_KVM_SYSTEM_TIME_NEW;
 		msr_kvm_wall_clock = MSR_KVM_WALL_CLOCK_NEW;
@@ -274,34 +279,32 @@ void __init kvmclock_init(void)
 	printk(KERN_INFO "kvm-clock: Using msrs %x and %x",
 		msr_kvm_system_time, msr_kvm_wall_clock);
 
-	// 为每个CPU分配struct pvclock_vsyscall_time_info内存
+	// 申请pvclock_page的内存，其中存储hv_clock数组，每个CPU有一个struct pvclock_vcpu_time_info
 	mem = memblock_alloc(size, PAGE_SIZE);
 	if (!mem)
 		return;
 	hv_clock = __va(mem);
 	memset(hv_clock, 0, size);
 
-	// 将pvti的gpa写入到MSR中，以告知VMM
+	// 将pvclock_page的物理地址注册到kvm中，此后kvm可以通过这块内存告知guest时间
 	if (kvm_register_clock("primary cpu clock")) {
 		hv_clock = NULL;
 		memblock_free(mem, size);
 		return;
 	}
 
-	// 如果支持steal time，设置之
+	// Stable TSC指的是各vCPU间的TSC是同步的
 	if (kvm_para_has_feature(KVM_FEATURE_CLOCKSOURCE_STABLE_BIT))
 		pvclock_set_flags(PVCLOCK_TSC_STABLE_BIT);
 
-	// 关抢占，获取cpu id
 	cpu = get_cpu();
-	// 读取VMM在pvti中设置的时间
 	vcpu_time = &hv_clock[cpu].pvti;
 	flags = pvclock_read_flags(vcpu_time);
 
+	// 注册sched_clock，用kvmclock替代默认的TSC实现
 	kvm_sched_clock_init(flags & PVCLOCK_TSC_STABLE_BIT);
-	// 开抢占
 	put_cpu();
-	// 在x86_platform中注册相应函数，它是x86_platform_ops类型变量，用于保存x86特有的函数集
+
 	x86_platform.calibrate_tsc = kvm_get_tsc_khz;
 	x86_platform.calibrate_cpu = kvm_get_tsc_khz;
 	x86_platform.get_wallclock = kvm_get_wallclock;
@@ -317,7 +320,7 @@ void __init kvmclock_init(void)
 	machine_ops.crash_shutdown  = kvm_crash_shutdown;
 #endif
 	kvm_get_preset_lpj();
-	// 注册时钟源
+	// 将kvmclock的频率设置为10^9，这样其读到的cycles其实就是纳秒数
 	clocksource_register_hz(&kvm_clock, NSEC_PER_SEC);
 	pv_info.name = "KVM";
 }

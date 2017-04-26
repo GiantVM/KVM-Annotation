@@ -84,6 +84,7 @@ module_param_named(eptad, enable_ept_ad_bits, bool, S_IRUGO);
 static bool __read_mostly emulate_invalid_guest_state = true;
 module_param(emulate_invalid_guest_state, bool, S_IRUGO);
 
+// 表示是否只有KVM一个VMM在执行，值为0则说明可能会有别的VMM（例如VirtualBox）与KVM同时运行
 static bool __read_mostly vmm_exclusive = 1;
 module_param(vmm_exclusive, bool, S_IRUGO);
 
@@ -943,8 +944,10 @@ static DECLARE_BITMAP(vmx_vpid_bitmap, VMX_NR_VPIDS);
 static DEFINE_SPINLOCK(vmx_vpid_lock);
 
 static struct vmcs_config {
-	int size;
-	int order;
+	int size;                // VMXON Region和VMCS的大小，在1-4096字节之间
+	int order;               // size的阶，即需要多少page来存放（log2尺度）
+	// 存储于IA32_VMX_BASIC MSR的revision id，用于初始化VMXON Region和VMCS，
+	// 不同型号的CPU间revision id若不同则VMCS内的数据格式不一定兼容
 	u32 revision_id;
 	u32 pin_based_exec_ctrl;
 	u32 cpu_based_exec_ctrl;
@@ -1637,8 +1640,6 @@ static noinline void vmwrite_error(unsigned long field, unsigned long value)
 static __always_inline void __vmcs_writel(unsigned long field, unsigned long value)
 {
 	u8 error;
-    // #define ASM_VMX_VMWRITE_RAX_RDX   ".byte 0x0f, 0x79, 0xd0"
-    //将RAX内容写入到RDX索引到的VMCS阑。RAX就是value rdx的值是field传递
 	asm volatile (__ex(ASM_VMX_VMWRITE_RAX_RDX) "; setna %0"
 		       : "=q"(error) : "a"(value), "d"(field) : "cc");
 	if (unlikely(error))
@@ -3234,6 +3235,8 @@ static void kvm_cpu_vmxon(u64 addr)
 			: "memory", "cc");
 }
 
+// 在当前Core上启用VMX（通过设置CR4），若配置为独占模式则可以进入VMX Root Operation，
+// 非独占模式则不能，因为可能其他VMM已经进入了VMX Operation
 static int hardware_enable(void)
 {
 	int cpu = raw_smp_processor_id();
@@ -3302,6 +3305,7 @@ static void kvm_cpu_vmxoff(void)
 	intel_pt_handle_vmx(0);
 }
 
+// 在当前Core上关闭VMX功能（通过设置CR4）
 static void hardware_disable(void)
 {
 	if (vmm_exclusive) {

@@ -207,6 +207,8 @@ struct kvm_mmio_fragment {
 struct kvm_vcpu {
 	struct kvm *kvm;
 #ifdef CONFIG_PREEMPT_NOTIFIERS
+	// kvm内核模块可能被抢占，并迁移到其他核上执行，因此需要注册preempt notifier
+	// 以保证迁移后还能顺利启动当前正在操作的vm
 	struct preempt_notifier preempt_notifier;
 #endif
 	int cpu;
@@ -393,7 +395,7 @@ struct kvm {
 	int created_vcpus;
 	int last_boosted_vcpu;
 	struct list_head vm_list;
-	struct mutex lock;
+	struct mutex lock; // 保护created_vcpus
 	struct kvm_io_bus *buses[KVM_NR_BUSES];
 #ifdef CONFIG_HAVE_KVM_EVENTFD
 	struct {
@@ -406,7 +408,7 @@ struct kvm {
 #endif
 	struct kvm_vm_stat stat;
 	struct kvm_arch arch;
-	atomic_t users_count;
+	atomic_t users_count; // 该struct的引用计数，通过kvm_get_kvm加一，kvm_put_vm减一，归零则销毁实例
 #ifdef KVM_COALESCED_MMIO_PAGE_OFFSET
 	struct kvm_coalesced_mmio_ring *coalesced_mmio_ring;
 	spinlock_t ring_lock;
