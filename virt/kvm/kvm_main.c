@@ -170,6 +170,8 @@ static void ack_flush(void *_completed)
 {
 }
 
+// 不仅会在所有vCPU上设置request bit，而且会强制处于Guest模式的vCPU
+// 退出Guest模式，以便在下一次循环执行处理request的代码
 bool kvm_make_all_cpus_request(struct kvm *kvm, unsigned int req)
 {
 	int i, cpu, me;
@@ -191,6 +193,8 @@ bool kvm_make_all_cpus_request(struct kvm *kvm, unsigned int req)
 		      kvm_vcpu_exiting_guest_mode(vcpu) != OUTSIDE_GUEST_MODE)
 			cpumask_set_cpu(cpu, cpus);
 	}
+	// 通过IPI通知指定CPU执行ack_flush，这会导致该CPU上正在执行的Guest vCPU
+	// 退出Guest模式，以执行IPI handler，这样该vCPU就会马上在下次循环执行request了
 	if (unlikely(cpus == NULL))
 		smp_call_function_many(cpu_online_mask, ack_flush, NULL, 1);
 	else if (!cpumask_empty(cpus))
@@ -3883,6 +3887,7 @@ int kvm_init(void *opaque, unsigned vcpu_size, unsigned vcpu_align,
 	kvm_vm_fops.owner = module;
 	kvm_vcpu_fops.owner = module;
 
+	// 注册对外的入口点"/dev/kvm"
 	r = misc_register(&kvm_dev);
 	if (r) {
 		pr_err("kvm: misc device register failed\n");

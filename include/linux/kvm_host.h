@@ -215,6 +215,10 @@ struct kvm_vcpu {
 	int vcpu_id;
 	int srcu_idx;
 	int mode;
+	// 这是一个bitmap，表示当前的pending requests，每个bit的具体定义见
+	// 本文件及arch/x86/include/asm/kvm_host.h中的KVM_REQ_xxx
+	// 在vcpu_enter_guest时会通过先通过kvm_check_request检查是否有pending requests，
+	// 处理完毕后再进入guest
 	unsigned long requests;
 	unsigned long guest_debug;
 

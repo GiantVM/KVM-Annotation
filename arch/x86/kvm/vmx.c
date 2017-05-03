@@ -112,6 +112,8 @@ module_param_named(pml, enable_pml, bool, S_IRUGO);
 #define KVM_VMX_TSC_MULTIPLIER_MAX     0xffffffffffffffffULL
 
 /* Guest_tsc -> host_tsc conversion requires 64-bit division.  */
+// preemption timer和host TSC的倍数关系，host TSC每走1 << cpu_preemption_timer_multi个cycle，
+// preemption timer走1个cycle
 static int __read_mostly cpu_preemption_timer_multi;
 static bool __read_mostly enable_preemption_timer = 1;
 #ifdef CONFIG_X86_64
@@ -622,6 +624,7 @@ struct vcpu_vmx {
 	/* apic deadline value in host tsc */
 	u64 hv_deadline_tsc;
 
+	// 当前VMCS中设置的tsc scaling ratio
 	u64 current_tsc_ratio;
 
 	bool guest_pkru_valid;
@@ -2627,10 +2630,14 @@ static void vmx_write_tsc_offset(struct kvm_vcpu *vcpu, u64 offset)
 		 * to the spec, this should set L1's TSC; The offset that L1
 		 * set for L2 remains unchanged, and still needs to be added
 		 * to the newly set TSC to get L2's TSC.
+		 * 此时的情况是这样：L1的配置是WRMSR可以直接写TSC而不引起VM Exit，
+		 * 由于L0不允许直接写TSC，故L2中的WRMSR TSC指令引起了VM Exit并最终
+		 * 调用到该函数（此时L2要设置的TSC值被转换为了与L0的TSC的差值）。
 		 */
 		struct vmcs12 *vmcs12;
 		to_vmx(vcpu)->nested.vmcs01_tsc_offset = offset;
 		/* recalculate vmcs02.TSC_OFFSET: */
+		// 刚才是从L2中退出，随后要回到L2，故VMCS中的tsc offset还需再加上L1为L2设置的offset
 		vmcs12 = get_vmcs12(vcpu);
 		vmcs_write64(TSC_OFFSET, offset +
 			(nested_cpu_has(vmcs12, CPU_BASED_USE_TSC_OFFSETING) ?

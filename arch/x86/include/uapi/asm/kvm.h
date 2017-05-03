@@ -190,7 +190,8 @@ struct kvm_msr_list {
 
 
 struct kvm_cpuid_entry {
-	__u32 function;
+	__u32 function; // 选择cpuid leaf用的eax值
+	// cpuid指令的返回值
 	__u32 eax;
 	__u32 ebx;
 	__u32 ecx;
@@ -206,9 +207,10 @@ struct kvm_cpuid {
 };
 
 struct kvm_cpuid_entry2 {
-	__u32 function;
-	__u32 index;
+	__u32 function; // 选择cpuid leaf用的eax值
+	__u32 index;    // 选择cpuid leaf用的ecx值（如果需要的话）
 	__u32 flags;
+	// cpuid指令的返回值
 	__u32 eax;
 	__u32 ebx;
 	__u32 ecx;
@@ -216,8 +218,12 @@ struct kvm_cpuid_entry2 {
 	__u32 padding[3];
 };
 
+// 表示index（即ecx）是有效的
 #define KVM_CPUID_FLAG_SIGNIFCANT_INDEX		(1 << 0)
+// 表示该entry所代表的cpuid leaf在连续两次cpuid调用中可能会返回不同的值，
+// 这种情况下所有可能的值都会有一个entry
 #define KVM_CPUID_FLAG_STATEFUL_FUNC		(1 << 1)
+// 对于KVM_CPUID_FLAG_STATEFUL_FUNC的entry，如果它是vCPU下次会读到的值，则设置该flag
 #define KVM_CPUID_FLAG_STATE_READ_NEXT		(1 << 2)
 
 /* for KVM_SET_CPUID2 */

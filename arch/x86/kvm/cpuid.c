@@ -770,6 +770,16 @@ static int move_to_next_stateful_cpuid_entry(struct kvm_vcpu *vcpu, int i)
 	/* when no next entry is found, the current entry[i] is reselected */
 	for (j = i + 1; ; j = (j + 1) % nent) {
 		struct kvm_cpuid_entry2 *ej = &vcpu->arch.cpuid_entries[j];
+		/* XXX 此处是bug？应该考虑index有效的情况，改为如下代码
+		if (ej->function != e->function)
+			continue;
+		if ((e->flags & KVM_CPUID_FLAG_SIGNIFCANT_INDEX) &&
+				(!(ej->flags & KVM_CPUID_FLAG_SIGNIFCANT_INDEX)
+				 || ej->index != e->index))
+			continue;
+		ej->flags |= KVM_CPUID_FLAG_STATE_READ_NEXT;
+		return j;
+		*/
 		if (ej->function == e->function) {
 			ej->flags |= KVM_CPUID_FLAG_STATE_READ_NEXT;
 			return j;

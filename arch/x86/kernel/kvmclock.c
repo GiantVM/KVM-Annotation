@@ -81,9 +81,9 @@ static int kvm_set_wallclock(const struct timespec *now)
 	return -1;
 }
 
-// 读取当前的ns数，读到的值总是单调增的，即使pvclock是unstable的
-// 如果pvclock是unstable的，则会用一个last_value记录上次读到的值，如果此次读到的值
-// 比last_value还小（时间跳回了过去），则返回last_value
+// 读取当前的ns数，读到的值总是单调增的，即使pvclock是unstable的。
+// 如果pvclock是unstable的，则会用一个last_value记录上次读到的值，
+// 如果此次读到的值比last_value还小（时间跳回了过去），则返回last_value
 static cycle_t kvm_clock_read(void)
 {
 	struct pvclock_vcpu_time_info *src;
@@ -137,6 +137,7 @@ static inline void kvm_sched_clock_init(bool stable)
  * Any heuristics is subject to fail, because ultimately, a large
  * poll of guests can be running and trouble each other. So we preset
  * lpj here
+ *
  * 直接通过pvclock获取guest的TSC频率，而不是让guest进行calibrate（那样不准确），公式如下
  * tsc_khz = ((10^6 << 32) / mult) >> shift
  */
@@ -293,7 +294,7 @@ void __init kvmclock_init(void)
 		return;
 	}
 
-	// Stable TSC指的是各vCPU间的TSC是同步的
+	// Stable TSC指的是各vCPU间的TSC是同步的（这同时也需要Host TSC是同步的）
 	if (kvm_para_has_feature(KVM_FEATURE_CLOCKSOURCE_STABLE_BIT))
 		pvclock_set_flags(PVCLOCK_TSC_STABLE_BIT);
 
@@ -325,6 +326,11 @@ void __init kvmclock_init(void)
 	pv_info.name = "KVM";
 }
 
+// 在kvmclock_init之后被调用，如果Host的TSC和Guest的virtual TSC都已经同步，
+// 则Host会将kvmclock设置位masterclock模式，并通过PVCLOCK_TSC_STABLE_BIT
+// 这一flag通知Guest。在masterclock模式下，Guest会将kvmclock的clocksource
+// 设置为PVCLOCK模式，使gettimeofday()等系统调用通过vDSO方式调用，
+// 直接读取vCPU 0的pvti
 int __init kvm_setup_vsyscall_timeinfo(void)
 {
 #ifdef CONFIG_X86_64

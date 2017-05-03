@@ -111,14 +111,22 @@ module_param(min_timer_period_us, uint, S_IRUGO | S_IWUSR);
 static bool __read_mostly kvmclock_periodic_sync = true;
 module_param(kvmclock_periodic_sync, bool, S_IRUGO);
 
+// 若host具备TSC scaling特性则为true，否则为false，对外提供KVM_CAP_TSC_CONTROL以读取该变量
 bool __read_mostly kvm_has_tsc_control;
 EXPORT_SYMBOL_GPL(kvm_has_tsc_control);
+// 允许设置的最高guest tsc频率，若用户试图通过KVM_SET_TSC_KHZ设置更高的频率将失败
 u32  __read_mostly kvm_max_guest_tsc_khz;
 EXPORT_SYMBOL_GPL(kvm_max_guest_tsc_khz);
+// AMD和Intel的TSC scaling功能中，表示小数的部分长度不一，AMD是32位
+// （即乘上multiplier后要右移32位），Intel是48位（即乘上multiplier后要右移48位），
+// 故抽象出一个变量
 u8   __read_mostly kvm_tsc_scaling_ratio_frac_bits;
 EXPORT_SYMBOL_GPL(kvm_tsc_scaling_ratio_frac_bits);
+// 允许设置的最大ratio，若用户试图通过KVM_SET_TSC_KHZ设置更高的ratio将失败，
+// 默认值为0xffffffff_ffffffff
 u64  __read_mostly kvm_max_tsc_scaling_ratio;
 EXPORT_SYMBOL_GPL(kvm_max_tsc_scaling_ratio);
+// 默认的scaling ratio，值为1ULL << kvm_tsc_scaling_ratio_frac_bits，即1.0倍
 u64 __read_mostly kvm_default_tsc_scaling_ratio;
 EXPORT_SYMBOL_GPL(kvm_default_tsc_scaling_ratio);
 
@@ -133,6 +141,8 @@ module_param(lapic_timer_advance_ns, uint, S_IRUGO | S_IWUSR);
 static bool __read_mostly vector_hashing = true;
 module_param(vector_hashing, bool, S_IRUGO);
 
+// 若Host的TSC是stable的，但在休眠并唤醒后发生倒退，则为true，否则为false
+// 注：有些CPU尽管TSC是同步且constant的，但可能在休眠后将TSC同步地置为0
 static bool __read_mostly backwards_tsc_observed = false;
 
 #define KVM_NR_SHARED_MSRS 16
@@ -1119,7 +1129,11 @@ static int do_set_msr(struct kvm_vcpu *vcpu, unsigned index, u64 *data)
 struct pvclock_gtod_data {
 	seqcount_t	seq;
 
-	struct { /* extract of a clocksource struct */
+	struct {
+		/* extract of a clocksource struct
+		 *
+		 * 从Host的monotonic time所基于的clocksource中截取一部分成员
+		 */
 		int vclock_mode;
 		cycle_t	cycle_last;
 		cycle_t	mask;
@@ -1127,17 +1141,29 @@ struct pvclock_gtod_data {
 		u32	shift;
 	} clock;
 
+	// 下面两个变量共同表示Host的boot time，用公式表示为
+	// boot_time = boot_ns + (nsec_base >> shift)
+	//
+	// 事实上在kernel的timekeeper中是这样设计的，monotonic time由
+	// xtime加上wall_to_monotonic得到，两者分别有sec部分和nsec部分，
+	// 此处的boot_ns是xtime的sec部分加上wall_to_monotonic的sec部分
+	// 和nsec部分，最后再加上从monotonic time到boot time的offset，
+	// 而nsec_base则是xtime的nsec部分
 	u64		boot_ns;
 	u64		nsec_base;
 };
 
+// 该变量维护Host的timekeeper中部分信息的一份副本，在kvmclock的masterclock模式下，
+// 用以更新kvmclock，这样可以保证各CPU上的vCPU共享同一个时钟源，它们的kvmclock可以实现同步
 static struct pvclock_gtod_data pvclock_gtod_data;
 
+// 每当Host要更新timekeeper中的时间时，会调用该函数更新pvclock_gtod_data
 static void update_pvclock_gtod(struct timekeeper *tk)
 {
 	struct pvclock_gtod_data *vdata = &pvclock_gtod_data;
 	u64 boot_ns;
 
+	// tkr_mono.base由xtime的sec部分和wall_to_monotonic的sec部分和nsec部分相加得到
 	boot_ns = ktime_to_ns(ktime_add(tk->tkr_mono.base, tk->offs_boot));
 
 	write_seqcount_begin(&vdata->seq);
@@ -1166,57 +1192,60 @@ void kvm_set_pending_timer(struct kvm_vcpu *vcpu)
 	kvm_make_request(KVM_REQ_PENDING_TIMER, vcpu);
 }
 
-// 计算VM启动时间，写入到wall_clock中
 static void kvm_write_wall_clock(struct kvm *kvm, gpa_t wall_clock)
 {
-    int version;
-    int r;
-    struct pvclock_wall_clock wc;
-    struct timespec64 boot;
+	int version;
+	int r;
+	struct pvclock_wall_clock wc;
+	struct timespec64 boot;
 
-    if (!wall_clock)
-        return;
+	if (!wall_clock)
+		return;
 
-    // 从guest的wall_clock(根据gpa)读出version
-    r = kvm_read_guest(kvm, wall_clock, &version, sizeof(version));
-    if (r)
-        return;
+	// 从Guest的wall_clock(根据gpa)读出version
+	r = kvm_read_guest(kvm, wall_clock, &version, sizeof(version));
+	if (r)
+		return;
 
-    // version为奇数，但明明没在写，是异常情况，需要先修复为偶数
-    if (version & 1)
-        ++version;  /* first time write, random junk */
+	// 只有首次写入wall_clock时，由于wall_clock没有初始化为0，导致读出垃圾值，
+	// 才可能造成version为奇数，此时修复成偶数
+	if (version & 1)
+		++version;  /* first time write, random junk */
 
-    // 写前设置奇数，表示正在修改
-    ++version;
+	// 将version置为奇数，表示正在修改
+	++version;
 
-    // 把更新后的version写回
-    if (kvm_write_guest(kvm, wall_clock, &version, sizeof(version)))
-        return;
+	if (kvm_write_guest(kvm, wall_clock, &version, sizeof(version)))
+		return;
 
-    /*
-     * The guest calculates current wall clock time by adding
-     * system time (updated by kvm_guest_time_update below) to the
-     * wall clock specified here.  guest system time equals host
-     * system time for us, thus we must fill in host boot time here.
-     */
-    // 获取host启动时的时间戳
-    getboottime64(&boot);
+	/*
+	 * The guest calculates current wall clock time by adding
+	 * system time (updated by kvm_guest_time_update below) to the
+	 * wall clock specified here.  guest system time equals host
+	 * system time for us, thus we must fill in host boot time here.
+	 *
+	 * Guest读取wall clock的时间点和Host写入pvclock_wall_clock结构体的时间
+	 * 并不一致，因此我们在pvclock_wall_clock中存储Host在boot时的wall clock时间，
+	 * Guest通过读取kvmclock提供的system time（Host自boot以来经过的时间），
+	 * 两者相加得到Guest读取wall clock时的真实wall time
+	 */
+	getboottime64(&boot);
 
-    // kvmclock_offset为host启动后到VM启动的相对时间(负数)，用host启动时间减去它(相等于加)得到VM启动的时间戳
-    if (kvm->arch.kvmclock_offset) {
-        struct timespec64 ts = ns_to_timespec64(kvm->arch.kvmclock_offset);
-        boot = timespec64_sub(boot, ts);
-    }
-    wc.sec = (u32)boot.tv_sec; /* overflow in 2106 guest time */
-    wc.nsec = boot.tv_nsec;
-    wc.version = version;
+	if (kvm->arch.kvmclock_offset) {
+		// 如果用户手动调整过kvmclock的时间，引入了一个offset，则我们的原则是
+		// 让Guest所见到的wall clock仍是真实的时间，而system time则带有offset
+		struct timespec64 ts = ns_to_timespec64(kvm->arch.kvmclock_offset);
+		boot = timespec64_sub(boot, ts);
+	}
+	wc.sec = (u32)boot.tv_sec; /* overflow in 2106 guest time */
+	wc.nsec = boot.tv_nsec;
+	wc.version = version;
 
-    // 更新时间
-    kvm_write_guest(kvm, wall_clock, &wc, sizeof(wc));
-    // 再次更新version，此时成为偶数，表示写完了
-    version++;
-    // 把更新后的version写回
-    kvm_write_guest(kvm, wall_clock, &version, sizeof(version));
+	kvm_write_guest(kvm, wall_clock, &wc, sizeof(wc));
+
+	// 将version置为偶数，表示修改完成
+	version++;
+	kvm_write_guest(kvm, wall_clock, &version, sizeof(version));
 }
 
 static uint32_t div_frac(uint32_t dividend, uint32_t divisor)
@@ -1283,11 +1312,32 @@ static int set_tsc_khz(struct kvm_vcpu *vcpu, u32 user_tsc_khz, bool scale)
 
 	/* TSC scaling supported? */
 	if (!kvm_has_tsc_control) {
+		// 本来此path只有在vcpu init时才会进入，是为了在不支持TSC scaling且
+		// TSC不是constant的Host上，保证Guest的virtual TSC频率不变而设置的，
+		// 此时该vCPU会被设置为catch up模式，当Host的TSC频率低于virtual TSC频率时，
+		// 每次VM Entry都修改Guest TSC以使得Guest TSC能在virtual TSC频率运行（尽管
+		// 此时Guest TSC为unstable TSC）
+		//
+		// 但实际上即使Host不支持TSC scaling，用户仍可以通过KVM_SET_TSC_KHZ
+		// 这个vcpu ioctl调用kvm_set_tsc_khz并最终进入此path，尽管文档中声称
+		// 用户只能在Host支持TSC scaling时调用KVM_SET_TSC_KHZ。
+		//
+		// 若用户设置了max_tsc_khz > user_tsc_khz > tsc_khz，虽然暂时能正常工作，
+		// 但假如Host TSC频率发生改变，变为tsc_khz_new > user_tsc_khz，则Guest
+		// TSC将不再能维持user_tsc_khz的工作频率，而必然以tsc_khz_new为新的
+		// 工作频率，因为Guest TSC相对于user_tsc_khz是走快了无法拨慢。若用户
+		// 设置的user_tsc_khz > max_tsc_khz，则总是能正常工作。（注：kvmclock
+		// 总是能正常工作，因为它的转换参数是根据Guest TSC实际工作频率而不是
+		// virtual_tsc_khz来的）
 		if (user_tsc_khz > tsc_khz) {
 			vcpu->arch.tsc_catchup = 1;
 			vcpu->arch.tsc_always_catchup = 1;
 			return 0;
 		} else {
+			// 显然user_tsc_khz < tsc_khz时，Guest TSC只能工作在tsc_khz
+			// 频率上，此前设置的virtual_tsc_khz将是无效的，应当警告用户。
+			// （如此看来似乎max_tsc_khz > user_tsc_khz > tsc_khz的情形
+			// 也应给出警告？）
 			WARN(1, "user requested TSC rate below hardware speed\n");
 			return -1;
 		}
@@ -1303,6 +1353,9 @@ static int set_tsc_khz(struct kvm_vcpu *vcpu, u32 user_tsc_khz, bool scale)
 		return -1;
 	}
 
+	// 在vcpu_load时才会将该值加载到VMCS中的scaling ratio里，这也就是下一次进行
+	// vcpu ioctl时（包括vcpu run），此外进入和离开nested Guest时也会利用该值
+	// 更新VMCS中的scaling ratio
 	vcpu->arch.tsc_scaling_ratio = ratio;
 	return 0;
 }
@@ -1330,6 +1383,9 @@ static int kvm_set_tsc_khz(struct kvm_vcpu *vcpu, u32 user_tsc_khz)
 	 * within the range of tolerance and decide if the
 	 * rate being applied is within that bounds of the hardware
 	 * rate.  If so, no scaling or compensation need be done.
+	 *
+	 * 要设置的virtual tsc频率如果在host tsc频率附近小邻域内，
+	 * 则视为两者相等，直接让guest tsc运行在host tsc频率上
 	 */
 	thresh_lo = adjust_tsc_khz(tsc_khz, -tsc_tolerance_ppm);
 	thresh_hi = adjust_tsc_khz(tsc_khz, tsc_tolerance_ppm);
@@ -1340,8 +1396,33 @@ static int kvm_set_tsc_khz(struct kvm_vcpu *vcpu, u32 user_tsc_khz)
 	return set_tsc_khz(vcpu, user_tsc_khz, use_scaling);
 }
 
+// 获取当前vCPU理论上的TSC value
 static u64 compute_guest_tsc(struct kvm_vcpu *vcpu, s64 kernel_ns)
 {
+	/*       this_tsc_write        tsc_now
+	 *              |<- elapsed_tsc ->|
+	 * Guest: ------|-----------------|----> virtual time
+	 *             /                 /
+	 * Host:  ----|-----------------|------> physical time
+	 *            |<-   elapsed   ->|
+	 *      this_tsc_nsec        kernel_ns
+	 *
+	 * kernel_ns是当前Host的boot time，this_tsc_nsec是上次Guest对TSC写入时Host的boot time，
+	 * this_tsc_write是上次Guest写入的TSC值
+	 *
+	 * 首先获得上次Guest对TSC写入以来经过的时间 elapsed = kernel_ns - this_tsc_nsec
+	 * 随后将这段时间转换为Guest中经过的TSC cycle数，得到elapsed_tsc = elapsed * virt_scaling_ratio
+	 * 最后计算得到当前的Guest TSC value，tsc_now = this_tsc_write + elapsed_tsc
+	 *
+	 * 注：此处的virtual time是以virtual_tsc_khz作为Guest TSC频率来计算的，实际上Guest中的TSC可能
+	 * 并不是该频率运行。如果Host支持TSC scaling，则可以通过调整VMCS中的scaling ratio来使Guest中的
+	 * TSC以virtual_tsc_khz运行，否则Guest中的TSC只能与Host以相同频率运行。
+	 *
+	 * 在KVM中，如果Host不支持TSC scaling，那么我们实际上不允许virtual_tsc_khz频率低于Host TSC实际频率，
+	 * 因为这会导致Guest中TSC走快了而我们无法拨慢TSC，但允许virtual_tsc_khz频率高于Host TSC实际频率，
+	 * 因为此时Guest中TSC是走慢了，我们可以令其catch up它的virtual time。事实上，假若Host不支持
+	 * constant TSC，KVM便会将virtual_tsc_khz设置为Host的最高TSC频率，以保证Guest的virtual TSC频率稳定。
+	 */
 	u64 tsc = pvclock_scale_delta(kernel_ns-vcpu->arch.this_tsc_nsec,
 				      vcpu->arch.virtual_tsc_mult,
 				      vcpu->arch.virtual_tsc_shift);
@@ -1349,6 +1430,8 @@ static u64 compute_guest_tsc(struct kvm_vcpu *vcpu, s64 kernel_ns)
 	return tsc;
 }
 
+// 在write_tsc之后检查一下是否所有Guest vCPU的TSC都已经同步，
+// 如果是则请求开启masterclock模式
 static void kvm_track_tsc_matching(struct kvm_vcpu *vcpu)
 {
 #ifdef CONFIG_X86_64
@@ -1379,6 +1462,9 @@ static void kvm_track_tsc_matching(struct kvm_vcpu *vcpu)
 
 static void update_ia32_tsc_adjust_msr(struct kvm_vcpu *vcpu, s64 offset)
 {
+	// 根据Intel手册，TSC改变delta，TSC_ADJUST也要相应改变delta，此处
+	// delta = offset - curr_offset = guest_new_tsc - guest_curr_tsc，
+	// 其中guest_new_tsc是Guest通过wrmsr tsc写入的新值
 	u64 curr_offset = kvm_x86_ops->read_tsc_offset(vcpu);
 	vcpu->arch.ia32_tsc_adjust_msr += offset - curr_offset;
 }
@@ -1440,6 +1526,22 @@ void kvm_write_tsc(struct kvm_vcpu *vcpu, struct msr_data *msr)
 	ns = get_kernel_ns();
 	elapsed = ns - kvm->arch.last_tsc_nsec;
 
+	/*       last_tsc_write                       data
+	 *              |                              |
+	 * Guest: ------|-----------------|------------|---> virtual time
+	 *             /                 /            /
+	 * Host:  ----|-----------------|------------|-----> physical time
+	 *            |<-   elapsed   ->|<- usdiff ->|
+	 *      last_tsc_nsec           ns
+	 *
+	 * last_tsc_nsec是上次Guest对TSC进行写入时的Host boot time，ns是当前的Host boot time，
+	 * last_tsc_write是上次Guest对TSC的写入值，data是本次Guest对TSC的写入值
+	 *
+	 * 首先获得上次Guest对TSC写入以来经过的时间elapsed = ns - last_tsc_nsec，并换算成微秒
+	 * 然后将data - last_tsc_write按照virtual_tsc_khz的频率换算成微秒，得到的时间应该是
+	 * elapsed + usdiff
+	 * 最后两者相减，得到usdiff，单位为微秒
+	 */
 	if (vcpu->arch.virtual_tsc_khz) {
 		int faulted = 0;
 
@@ -1484,13 +1586,41 @@ void kvm_write_tsc(struct kvm_vcpu *vcpu, struct msr_data *msr)
 	 * TSC, we add elapsed time in this computation.  We could let the
 	 * compensation code attempt to catch up if we fall behind, but
 	 * it's better to try to match offsets from the beginning.
-         */
+	 *
+	 * 对于usdiff小于一秒的情况，我们理解为Guest试图同步TSC，但仅当各vCPU的
+	 * virtual TSC频率相同时Guest可以同步TSC，否则显然不可能实现同步。
+	 *
+	 * 我们设计了分代式的Guest TSC同步机制，凡是互相同步的（Guest进行了同步尝试的）
+	 * vCPU，我们算作同一代，若出现一个不与当前正在进行同步的这一代同步的vCPU，
+	 * 则当前正在进行同步的这一代被废弃，开启下一代，以此类推，直到所有vCPU
+	 * 都处在同一代为止，同步成功。
+	 */
 	if (usdiff < USEC_PER_SEC &&
 	    vcpu->arch.virtual_tsc_khz == kvm->arch.last_tsc_khz) {
 		if (!check_tsc_unstable()) {
+			// Host若具备stable TSC，则我们将所有互相同步的vCPU的TSC offset
+			// 设置为同一个值，即可保证它们的同步
 			offset = kvm->arch.cur_tsc_offset;
 			pr_debug("kvm: matched tsc offset for %llu\n", data);
 		} else {
+			// Host若为unstable TSC，则会开启catch up模式，互相同步的vCPU
+			// 具备相同的this_tsc_nsec和this_tsc_write（即这一代中第一个
+			// 写入TSC者的写入时间和写入值），每次更新Guest时间
+			// （kvm_guest_time_update，至少每300秒会进行一次）时都会据此
+			// 调整Guest TSC，某vCPU的tsc若走得太慢了则拨快Guest时间，
+			// 若走得太快则无法采取应对措施，因为不能使Guest TSC发生倒退。
+			//
+			// 进行调整时就是调用下文所述的compute_guest_tsc()求得Guest TSC
+			// 理论上的正确值，从而修正当前vCPU上的错误值
+			//
+			// XXX 此处为offset加上elapsed似乎是多余的，应是一个历史遗留问题。
+			// 在早期的实现中，diff是不减去elapsed的，也就是说以前是将本次写入的
+			// TSC值与上次写入的值很接近的情况，视为Guest在试图同步TSC。此时，
+			// 可能实际上已经经过了较长时间，故有必要加上elapsed时间从而
+			// 与真实时间匹配。而现在的实现中，已经不需要加上elapsed时间，因为
+			// 从我们对Guest试图同步TSC的新的定义来看，其写入的值data的误差最多
+			// 不超过一秒，否则无法进入这个分支，若再加上elapsed时间反而会导致
+			// 其TSC走得过快
 			u64 delta = nsec_to_cycles(vcpu, elapsed);
 			data += delta;
 			offset = kvm_compute_tsc_offset(vcpu, data);
@@ -1507,6 +1637,8 @@ void kvm_write_tsc(struct kvm_vcpu *vcpu, struct msr_data *msr)
 		 * exact software computation in compute_guest_tsc()
 		 *
 		 * These values are tracked in kvm->arch.cur_xxx variables.
+		 *
+		 * 若usdiff大于一秒，我们认为产生了新的一代，Guest vCPU需要重新同步
 		 */
 		kvm->arch.cur_tsc_generation++;
 		kvm->arch.cur_tsc_nsec = ns;
@@ -1532,34 +1664,40 @@ void kvm_write_tsc(struct kvm_vcpu *vcpu, struct msr_data *msr)
 	vcpu->arch.this_tsc_nsec = kvm->arch.cur_tsc_nsec;
 	vcpu->arch.this_tsc_write = kvm->arch.cur_tsc_write;
 
+	// Guest修改了TSC，应该引起Guest的TSC_ADJUST同步变动
 	if (guest_cpuid_has_tsc_adjust(vcpu) && !msr->host_initiated)
 		update_ia32_tsc_adjust_msr(vcpu, offset);
 	kvm_x86_ops->write_tsc_offset(vcpu, offset);
 	raw_spin_unlock_irqrestore(&kvm->arch.tsc_write_lock, flags);
 
 	spin_lock(&kvm->arch.pvclock_gtod_sync_lock);
+	// 更新vCPU的TSC同步情况
 	if (!matched) {
 		kvm->arch.nr_vcpus_matched_tsc = 0;
 	} else if (!already_matched) {
 		kvm->arch.nr_vcpus_matched_tsc++;
 	}
 
+	// 检查是否Guest vCPU的TSC都已经同步，如果是则请求开启masterclock模式
 	kvm_track_tsc_matching(vcpu);
 	spin_unlock(&kvm->arch.pvclock_gtod_sync_lock);
 }
 
 EXPORT_SYMBOL_GPL(kvm_write_tsc);
 
+// 为VMCS中的tsc offset增加adjustment
 static inline void adjust_tsc_offset_guest(struct kvm_vcpu *vcpu,
 					   s64 adjustment)
 {
 	kvm_x86_ops->adjust_tsc_offset_guest(vcpu, adjustment);
 }
 
+// 为了抵消Host的TSC值delta = adjustment的减少，为VMCS中的tsc offset增加
+// delta' = adjustment * scaling_ratio
 static inline void adjust_tsc_offset_host(struct kvm_vcpu *vcpu, s64 adjustment)
 {
 	if (vcpu->arch.tsc_scaling_ratio != kvm_default_tsc_scaling_ratio)
-		WARN_ON(adjustment < 0);
+		WARN_ON(adjustment < 0); // adjustment应该是一个正值，表示Host TSC的倒退量
 	adjustment = kvm_scale_tsc(vcpu, (u64) adjustment);
 	kvm_x86_ops->adjust_tsc_offset_guest(vcpu, adjustment);
 }
@@ -1597,6 +1735,8 @@ static inline u64 vgettsc(cycle_t *cycle_now)
 	return v * gtod->clock.mult;
 }
 
+// 读取当前Host的boot time和tsc value，分别存储于t和cycle_now
+// （只有当Host以tsc为clocksource时有效）
 static int do_monotonic_boot(s64 *t, cycle_t *cycle_now)
 {
 	struct pvclock_gtod_data *gtod = &pvclock_gtod_data;
@@ -1657,7 +1797,7 @@ static bool kvm_get_time_and_clockread(s64 *kernel_ns, cycle_t *cycle_now)
  *
  * That is, when timespec0 != timespec1, M < N. Unfortunately that is not
  * always the case (the difference between two distinct xtime instances
- * might be smaller then the difference between corresponding TSC reads,
+ * might be smaller than the difference between corresponding TSC reads,
  * when updating guest vcpus pvclock areas).
  *
  * To avoid that problem, do not allow visibility of distinct
@@ -1666,6 +1806,15 @@ static bool kvm_get_time_and_clockread(s64 *kernel_ns, cycle_t *cycle_now)
  * in lockstep.
  *
  * Rely on synchronization of host TSCs and guest TSCs for monotonicity.
+ *
+ * 如上所述，由各个CPU各自读取其boot time和tsc值，可能会导致
+ * boot_time1 - boot_time0 != tsc1 - tsc0，且孰大孰小都有可能，
+ * 而要保证kvmclock的单调性则必须要求LHS > RHS。因此，由各个CPU各自读取
+ * boot time和tsc值是无法实现单调增的kvmclock的，必须维护一份master copy，
+ * 所有CPU都采用这份master中记录的boot time和tsc值，才能实现单调增的kvmclock。
+ *
+ * 上述维护master copy而实现单调增的kvmclock的思路，即kvmclock中的master clock模式，
+ * master copy即kvm->arch.master_cycle_now和kvm->arch.master_kernel_ns
  *
  */
 
@@ -1682,11 +1831,38 @@ static void pvclock_update_vm_gtod_copy(struct kvm *kvm)
 	/*
 	 * If the host uses TSC clock, then passthrough TSC as stable
 	 * to the guest.
+	 *
+	 * Host使用tsc作为clocksource，说明Host的tsc是stable的，在此基础上
+	 * 才有可能虚拟出Guest的stable tsc
 	 */
 	host_tsc_clocksource = kvm_get_time_and_clockread(
 					&ka->master_kernel_ns,
 					&ka->master_cycle_now);
 
+	// vcpus_matched:
+	//   在stable host tsc的前提下，还应该有各vCPU的tsc scaling ratio和
+	//   tsc offset相同，才能够得到stable的guest tsc，这一点是通过我们在
+	//   kvm_write_tsc中实现的tsc分代匹配机制实现的。我们会捕获到Guest OS
+	//   在启动时通过写入TSC进行的同步各vCPU TSC的行为，并为各同步的vCPU
+	//   （同步的vCPU显然scaling ratio也必须相同）设置相同的tsc offset，
+	//   从而实现同步的guest tsc。
+	//
+	// backward tsc：
+	//   如果在hardware_enable阶段发现了backward tsc，说明Host经过了一段时间
+	//   的休眠，唤醒后TSC被重置为0。由于我们在hardware_enable函数中时，尚在唤醒
+	//   过程中，暂时无法得知经过了多久的休眠，此时理论上正确的Host TSC值
+	//   （即假设TSC为invariant的，则其当前应该为何值）又是多少。
+	//
+	//   我们知道，正常情况下（假设Host支持TSC scaling），guest_tsc =
+	//   host_tsc * scaling_ratio + offset。发生backward tsc时，既然无法知道
+	//   正确的host_tsc值，正确的guest_tsc值自然也无法求得，只能用各vCPU上最大的
+	//   last_host_tsc（上次vcpu_put时的Host TSC值）推算一个值作为代替。
+	//   此时，Guest TSC相对于真实时间（wall time），必然是落后的，故不能
+	//   视为stable TSC，必须关闭master clock模式。
+	//
+	// 当以上条件都满足时，我们知道此时已经有了stable的（即频率稳定且同步的）
+	// host tsc和guest tsc，因此可以通过让kvmclock使用一份master copy更新时间，
+	// 来实现stable的kvmclock，即masterclock模式
 	ka->use_master_clock = host_tsc_clocksource && vcpus_matched
 				&& !backwards_tsc_observed
 				&& !ka->boot_vcpu_runs_old_kvmclock;
@@ -1702,6 +1878,8 @@ static void pvclock_update_vm_gtod_copy(struct kvm *kvm)
 
 void kvm_make_mclock_inprogress_request(struct kvm *kvm)
 {
+	// 不仅会在所有vCPU上设置request bit，而且会强制处于Guest模式的vCPU
+	// 退出Guest模式，以便在下一次循环执行处理request的代码
 	kvm_make_all_cpus_request(kvm, KVM_REQ_MCLOCK_INPROGRESS);
 }
 
@@ -1714,13 +1892,20 @@ static void kvm_gen_update_masterclock(struct kvm *kvm)
 
 	spin_lock(&ka->pvclock_gtod_sync_lock);
 	kvm_make_mclock_inprogress_request(kvm);
-	/* no guest entries from this point */
+	/* no guest entries from this point
+	 *
+	 * 在vcpu_enter_guest中，如果vcpu->requests中有request未处理，就不会调用
+	 * kvm_x86_ops->run执行VM Entry。此处的KVM_REQ_MCLOCK_INPROGRESS并没有相应
+	 * 的handler，所以从此处开始，所有vCPU都已经退出Guest模式并不允许再进入
+	 */
 	pvclock_update_vm_gtod_copy(kvm);
 
 	kvm_for_each_vcpu(i, vcpu, kvm)
 		kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
 
-	/* guest entries allowed */
+	/* guest entries allowed
+	 * 清空该request bit后，各vCPU又能够重新进入Guest模式了
+	 */
 	kvm_for_each_vcpu(i, vcpu, kvm)
 		clear_bit(KVM_REQ_MCLOCK_INPROGRESS, &vcpu->requests);
 
@@ -1733,6 +1918,8 @@ static int kvm_guest_time_update(struct kvm_vcpu *v)
 	unsigned long flags, tgt_tsc_khz;
 	struct kvm_vcpu_arch *vcpu = &v->arch;
 	struct kvm_arch *ka = &v->kvm->arch;
+	// kernel_ns是Host的boot time，host_tsc是Host的tsc值，如果是masterclock模式，
+	// 则统一从pvclock_gtod_data中获取，否则各CPU各自获取
 	s64 kernel_ns;
 	u64 tsc_timestamp, host_tsc;
 	struct pvclock_vcpu_time_info guest_hv_clock;
@@ -1745,11 +1932,14 @@ static int kvm_guest_time_update(struct kvm_vcpu *v)
 	/*
 	 * If the host uses TSC clock, then passthrough TSC as stable
 	 * to the guest.
+	 *
+	 * 如果Host处在masterclock模式，则使用tsc clocksource提供的时间。
+	 * 该时间在kvm_gen_update_masterclock中已经通过调用
+	 * pvclock_update_vm_gtod_copy获取到，存储在ka->master_cycle_now和
+	 * ka->master_kernel_ns中
 	 */
-	// 从kvm_arch读出host的当前时间，需要加锁
 	spin_lock(&ka->pvclock_gtod_sync_lock);
 	use_master_clock = ka->use_master_clock;
-	// 如果host使用TSC作为时间源，直接使用vcpu上的时间即可(passthrough)
 	if (use_master_clock) {
 		host_tsc = ka->master_cycle_now;
 		kernel_ns = ka->master_kernel_ns;
@@ -1764,15 +1954,13 @@ static int kvm_guest_time_update(struct kvm_vcpu *v)
 		kvm_make_request(KVM_REQ_CLOCK_UPDATE, v);
 		return 1;
 	}
-	// 否则需要从别的时间源读
+	// 非masterclock模式，则各CPU各自取自己的boot time和tsc
 	if (!use_master_clock) {
-		// 读取host当前的tsc
 		host_tsc = rdtsc();
-		// 读取host启动以来的时间
 		kernel_ns = get_kernel_ns();
 	}
 
-	// 读VM当前的tsc
+	// 获取Guest当前的实际TSC value
 	tsc_timestamp = kvm_read_l1_tsc(v, host_tsc);
 
 	/*
@@ -1786,9 +1974,10 @@ static int kvm_guest_time_update(struct kvm_vcpu *v)
 	 *  very slowly.
 	 */
 	if (vcpu->tsc_catchup) {
-		// 计算guest中此时的tsc应该是多少
+		// 根据virtual_tsc_khz（Guest的虚拟TSC频率）算出理论上Guest的当前TSC值，
+		// 如果Guest实际的TSC落后于该值，则让他catch up，若领先于该值，由于
+		// 不能让TSC回退，无法处理
 		u64 tsc = compute_guest_tsc(v, kernel_ns);
-		// 如果比从guest中读出的大，说明VM走慢了，修正为host算出的值
 		if (tsc > tsc_timestamp) {
 			adjust_tsc_offset_guest(v, tsc - tsc_timestamp);
 			tsc_timestamp = tsc;
@@ -1800,10 +1989,14 @@ static int kvm_guest_time_update(struct kvm_vcpu *v)
 	if (!vcpu->pv_time_enabled)
 		return 0;
 
+	// tgt_tsc_khz为Guest TSC实际运行的频率
 	if (kvm_has_tsc_control)
 		tgt_tsc_khz = kvm_scale_tsc(v, tgt_tsc_khz);
 
-	// 如果当前guest时钟的频率不同，则更新转换比例
+	// 若Guest TSC的运行频率发生了变化，则需要更新kvmclock中的转换数。
+	// 注意，kvmclock是根据Guest TSC的实际频率来的，不论Guest TSC是否
+	// 能以其virtual_tsc_khz的虚拟频率运行，Guest从kvmclock读到的数据总是
+	// （至少和Host同等程度）正确的。
 	if (unlikely(vcpu->hw_tsc_khz != tgt_tsc_khz)) {
 		kvm_get_time_scale(NSEC_PER_SEC, tgt_tsc_khz * 1000LL,
 				   &vcpu->hv_clock.tsc_shift,
@@ -1812,9 +2005,7 @@ static int kvm_guest_time_update(struct kvm_vcpu *v)
 	}
 
 	/* With all the info we got, fill in the values */
-	// 设置时的guest的tsc，用于guest更新时间时参照该值进行修正
 	vcpu->hv_clock.tsc_timestamp = tsc_timestamp;
-	// 设置当前时间
 	vcpu->hv_clock.system_time = kernel_ns + v->kvm->arch.kvmclock_offset;
 	vcpu->last_guest_tsc = tsc_timestamp;
 
@@ -1838,19 +2029,22 @@ static int kvm_guest_time_update(struct kvm_vcpu *v)
 	 */
 	BUILD_BUG_ON(offsetof(struct pvclock_vcpu_time_info, version) != 0);
 
-	// 更新结构中的version，表示正在修改数据结构
+	// 将version改为奇数，表示正在修改kvmclock
 	vcpu->hv_clock.version = guest_hv_clock.version + 1;
 	kvm_write_guest_cached(v->kvm, &vcpu->pv_time,
 				&vcpu->hv_clock,
 				sizeof(vcpu->hv_clock.version));
 
-	// 当然需要写屏障
+	// 虽然本vCPU已经暂停，但Guest的其他vCPU仍可能读取kvmclock，
+	// 故需遵循协议，保证其他vCPU见到的顺序
 	smp_wmb();
 
-	// 更新结构中的flag
 	/* retain PVCLOCK_GUEST_STOPPED if set in guest copy */
 	pvclock_flags = (guest_hv_clock.flags & PVCLOCK_GUEST_STOPPED);
 
+	// 用户可以通过KVM_KVMCLOCK_CTRL这个vcpu ioctl设置这个flag，
+	// 通知Guest它已经被暂停过了，因此watchdog发现kvmclock的值
+	// 发生跳变也不要将其设置为unstable
 	if (vcpu->pvclock_set_guest_stopped_request) {
 		pvclock_flags |= PVCLOCK_GUEST_STOPPED;
 		vcpu->pvclock_set_guest_stopped_request = false;
@@ -1862,17 +2056,16 @@ static int kvm_guest_time_update(struct kvm_vcpu *v)
 
 	vcpu->hv_clock.flags = pvclock_flags;
 
-	// 更新结构
 	trace_kvm_pvclock_update(v->vcpu_id, &vcpu->hv_clock);
 
 	kvm_write_guest_cached(v->kvm, &vcpu->pv_time,
 				&vcpu->hv_clock,
 				sizeof(vcpu->hv_clock));
 
-	// 依然需要写屏障
+	// 同上，需保证其他vCPU所见到的顺序
 	smp_wmb();
 
-	// 再次更新版本，表示写入完成
+	// 将version改为偶数，表示修改完成
 	vcpu->hv_clock.version++;
 	kvm_write_guest_cached(v->kvm, &vcpu->pv_time,
 				&vcpu->hv_clock,
@@ -2775,9 +2968,19 @@ void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
 			mark_tsc_unstable("KVM discovered backwards TSC");
 
 		if (check_tsc_unstable()) {
+			// 调用vcpu_load时，vCPU可能仍在原来的CPU上运行，也可能
+			// 已经迁移到新的CPU上。如果Host TSC是unstable的，新的
+			// TSC可能落后于原来的TSC，为了防止Guest同一个vCPU上的TSC
+			// 发生回退（从硬件上来说，同一个CPU上的TSC值应当总是单调增的，
+			// 除非发生overflow，我们应当模拟这一点），将Guest TSC设置为
+			// 上次VM Exit、wrmsr tsc或clock update（catch up）时的值。
 			u64 offset = kvm_compute_tsc_offset(vcpu,
 						vcpu->arch.last_guest_tsc);
 			kvm_x86_ops->write_tsc_offset(vcpu, offset);
+
+			// 需要注意的是，这样设置以后，Guest TSC会稍微落后于理论上的
+			// 正确值（因迁移所花时间未计入），这会在guest clock update时
+			// catch up
 			vcpu->arch.tsc_catchup = 1;
 		}
 		if (kvm_lapic_hv_timer_in_use(vcpu) &&
@@ -5859,6 +6062,8 @@ static int pvclock_gtod_notify(struct notifier_block *nb, unsigned long unused,
 
 	/* disable master clock if host does not trust, or does not
 	 * use, TSC clocksource
+	 *
+	 * 如果发现Host弃用了tsc clocksource，则应关闭master clock模式
 	 */
 	if (gtod->clock.vclock_mode != VCLOCK_TSC &&
 	    atomic_read(&kvm_guest_has_master_clock) != 0)
@@ -7416,7 +7621,6 @@ void kvm_arch_vcpu_free(struct kvm_vcpu *vcpu)
 	free_cpumask_var(wbinvd_dirty_mask);
 }
 
-// 根据架构创建vcpu
 struct kvm_vcpu *kvm_arch_vcpu_create(struct kvm *kvm,
                         unsigned int id)
 {
@@ -7433,7 +7637,6 @@ struct kvm_vcpu *kvm_arch_vcpu_create(struct kvm *kvm,
     return vcpu;
 }
 
-// 根据架构设置kvm_vcpu
 int kvm_arch_vcpu_setup(struct kvm_vcpu *vcpu)
 {
     int r;
@@ -7616,6 +7819,8 @@ int kvm_arch_hardware_enable(void)
 			kvm_for_each_vcpu(i, vcpu, kvm) {
 				vcpu->arch.tsc_offset_adjustment += delta_cyc;
 				vcpu->arch.last_host_tsc = local_tsc;
+				// 如果发现Host有backward tsc，则必须关闭master clock模式，
+				// 详见pvclock_update_vm_gtod_copy中的注释
 				kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
 			}
 
@@ -7713,6 +7918,9 @@ int kvm_arch_vcpu_init(struct kvm_vcpu *vcpu)
 	}
 	vcpu->arch.pio_data = page_address(page);
 
+	// 设置Guest的virtual TSC频率，使其默认值为Host的最高TSC频率（若Host不支持
+	// constant TSC，则会通过catch up模式使得Host TSC频率低于最高频率时，Guest的
+	// virtual TSC仍能保持其虚拟频率，但显然此时Guest TSC将是unstable的了）
 	kvm_set_tsc_khz(vcpu, max_tsc_khz);
 
 	r = kvm_mmu_create(vcpu);
