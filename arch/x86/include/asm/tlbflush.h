@@ -111,6 +111,7 @@ static inline void cr4_clear_bits(unsigned long mask)
 }
 
 /* Read the CR4 shadow. */
+// https://patchwork.kernel.org/patch/5082641/
 static inline unsigned long cr4_read_shadow(void)
 {
 	return this_cpu_read(cpu_tlbstate.cr4);

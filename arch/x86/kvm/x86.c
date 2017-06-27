@@ -6823,7 +6823,7 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 			r = 1;
 			goto out;
 		}
-
+		// 中断注入
 		if (inject_pending_event(vcpu, req_int_win) != 0)
 			req_immediate_exit = true;
 		else {
@@ -8192,22 +8192,26 @@ int kvm_arch_create_memslot(struct kvm *kvm, struct kvm_memory_slot *slot,
 {
 	int i;
 
+	// KVM_NR_PAGE_SIZES = 3
 	for (i = 0; i < KVM_NR_PAGE_SIZES; ++i) {
 		struct kvm_lpage_info *linfo;
 		unsigned long ugfn;
 		int lpages;
 		int level = i + 1;
-
+		// 当前级页表所需的表项数
 		lpages = gfn_to_index(slot->base_gfn + npages - 1,
 				      slot->base_gfn, level) + 1;
-
+		// 为 level 1-3的页表创建rmap
+		// level 4 不用是因为只有一页，无需反向索引
 		slot->arch.rmap[i] =
 			kvm_kvzalloc(lpages * sizeof(*slot->arch.rmap[i]));
 		if (!slot->arch.rmap[i])
 			goto out_free;
+
+		// 只为level 2-3的页表创建lpage_info
 		if (i == 0)
 			continue;
-
+		// 创建lpage_info ，维护下一级页表是否关闭hugepage
 		linfo = kvm_kvzalloc(lpages * sizeof(*linfo));
 		if (!linfo)
 			goto out_free;
@@ -8224,6 +8228,7 @@ int kvm_arch_create_memslot(struct kvm *kvm, struct kvm_memory_slot *slot,
 		 * other, or if explicitly asked to, disable large page
 		 * support for this slot
 		 */
+		// 如果slot的gfn和hva换算过来的fn不相同，无法使用hugepage
 		if ((slot->base_gfn ^ ugfn) & (KVM_PAGES_PER_HPAGE(level) - 1) ||
 		    !kvm_largepages_enabled()) {
 			unsigned long j;

@@ -317,8 +317,10 @@ static int is_large_pte(u64 pte)
 
 static int is_last_spte(u64 pte, int level)
 {
+	// level 1
 	if (level == PT_PAGE_TABLE_LEVEL)
 		return 1;
+	// 如果是hugepage的最后一级
 	if (is_large_pte(pte))
 		return 1;
 	return 0;
@@ -712,17 +714,21 @@ static void mmu_free_memory_cache_page(struct kvm_mmu_memory_cache *mc)
 		free_page((unsigned long)mc->objects[--mc->nobjs]);
 }
 
+// 保证各cache充足
 static int mmu_topup_memory_caches(struct kvm_vcpu *vcpu)
 {
+	// r不为0表示从slab分配/__get_free_page失败，直接返回错误
 	int r;
-
+	// 如果 vcpu->arch.mmu_pte_list_desc_cache 不足，从 pte_list_desc_cache 中分配
 	r = mmu_topup_memory_cache(&vcpu->arch.mmu_pte_list_desc_cache,
 				   pte_list_desc_cache, 8 + PTE_PREFETCH_NUM);
 	if (r)
 		goto out;
+    // 如果 vcpu->arch.mmu_page_cache 不足，直接通过 __get_free_page 分配
 	r = mmu_topup_memory_cache_page(&vcpu->arch.mmu_page_cache, 8);
 	if (r)
 		goto out;
+	// 如果 vcpu->arch.mmu_page_header_cache 不足，从 mmu_page_header_cache 中分配
 	r = mmu_topup_memory_cache(&vcpu->arch.mmu_page_header_cache,
 				   mmu_page_header_cache, 4);
 out:
@@ -948,16 +954,20 @@ static int mapping_level(struct kvm_vcpu *vcpu, gfn_t large_gfn,
 /*
  * Returns the number of pointers in the rmap chain, not counting the new one.
  */
+// 往rmap或parent_ptes中添加反向映射
 static int pte_list_add(struct kvm_vcpu *vcpu, u64 *spte,
 			struct kvm_rmap_head *rmap_head)
 {
+	// pte_list_desc是链表节点，成员sptes是能够存放PTE_LIST_EXT(3)个pte指针的数组
 	struct pte_list_desc *desc;
 	int i, count = 0;
 
+	// rmap/parent_ptes当前没有pte，直接设置为val
 	if (!rmap_head->val) {
 		rmap_printk("pte_list_add: %p %llx 0->1\n", spte, *spte);
 		rmap_head->val = (unsigned long)spte;
 	} else if (!(rmap_head->val & 1)) {
+		// parent_ptes当前有1个pte(是一个pte)，需要用链表来维护，于是分配一个链表节点desc，把原来的和新加入的分别放到desc->sptes数组的0和1位置
 		rmap_printk("pte_list_add: %p %llx 1->many\n", spte, *spte);
 		desc = mmu_alloc_pte_list_desc(vcpu);
 		desc->sptes[0] = (u64 *)rmap_head->val;
@@ -965,16 +975,19 @@ static int pte_list_add(struct kvm_vcpu *vcpu, u64 *spte,
 		rmap_head->val = (unsigned long)desc | 1;
 		++count;
 	} else {
+		// rmap/parent_ptes当前有多个pte(是一个链表项)，遍历链表，直到最后一个链表项
 		rmap_printk("pte_list_add: %p %llx many->many\n", spte, *spte);
 		desc = (struct pte_list_desc *)(rmap_head->val & ~1ul);
 		while (desc->sptes[PTE_LIST_EXT-1] && desc->more) {
 			desc = desc->more;
 			count += PTE_LIST_EXT;
 		}
+		// 如果最后一个链表项没空位，需要新分配一个，然后加到链表尾部
 		if (desc->sptes[PTE_LIST_EXT-1]) {
 			desc->more = mmu_alloc_pte_list_desc(vcpu);
 			desc = desc->more;
 		}
+		// 将新的pte放到该链表项sptes数组的第一个空位
 		for (i = 0; desc->sptes[i]; ++i)
 			++count;
 		desc->sptes[i] = spte;
@@ -1045,8 +1058,9 @@ static struct kvm_rmap_head *__gfn_to_rmap(gfn_t gfn, int level,
 					   struct kvm_memory_slot *slot)
 {
 	unsigned long idx;
-
+	// 通过gfn和slot->base_gfn，算出该页在slot中的index
 	idx = gfn_to_index(gfn, slot->base_gfn, level);
+	// 从该slot中取出对应的rmap
 	return &slot->arch.rmap[level - PT_PAGE_TABLE_LEVEL][idx];
 }
 
@@ -1073,7 +1087,7 @@ static int rmap_add(struct kvm_vcpu *vcpu, u64 *spte, gfn_t gfn)
 {
 	struct kvm_mmu_page *sp;
 	struct kvm_rmap_head *rmap_head;
-
+	// 获取页表页的
 	sp = page_header(__pa(spte));
 	kvm_mmu_page_set_gfn(sp, spte - sp->spt, gfn);
 	rmap_head = gfn_to_rmap(vcpu->kvm, gfn, sp);
@@ -1749,8 +1763,9 @@ static void drop_parent_pte(struct kvm_mmu_page *sp,
 static struct kvm_mmu_page *kvm_mmu_alloc_page(struct kvm_vcpu *vcpu, int direct)
 {
 	struct kvm_mmu_page *sp;
-
+	// 从cache中分配一个 kvm_mmu_page (页表项结构)
 	sp = mmu_memory_cache_alloc(&vcpu->arch.mmu_page_header_cache);
+	// 从cache中分配一个page (页结构) 作为 kvm_mmu_page的spt
 	sp->spt = mmu_memory_cache_alloc(&vcpu->arch.mmu_page_cache);
 	if (!direct)
 		sp->gfns = mmu_memory_cache_alloc(&vcpu->arch.mmu_page_cache);
@@ -1761,6 +1776,7 @@ static struct kvm_mmu_page *kvm_mmu_alloc_page(struct kvm_vcpu *vcpu, int direct
 	 * page until it is zapped. kvm_zap_obsolete_pages depends on
 	 * this feature. See the comments in kvm_zap_obsolete_pages().
 	 */
+	// 加入到活跃页表页链表进行管理
 	list_add(&sp->link, &vcpu->kvm->arch.active_mmu_pages);
 	kvm_mod_used_mmu_pages(vcpu->kvm, +1);
 	return sp;
@@ -2126,6 +2142,7 @@ static struct kvm_mmu_page *kvm_mmu_get_page(struct kvm_vcpu *vcpu,
 	bool flush = false;
 	LIST_HEAD(invalid_list);
 
+	// 初始化role，从base拷一份，然后进行设置更新
 	role = vcpu->arch.mmu.base_role;
 	role.level = level;
 	role.direct = direct;
@@ -2138,13 +2155,15 @@ static struct kvm_mmu_page *kvm_mmu_get_page(struct kvm_vcpu *vcpu,
 		quadrant &= (1 << ((PT32_PT_BITS - PT64_PT_BITS) * level)) - 1;
 		role.quadrant = quadrant;
 	}
+	// 判断该页表页是否在以前就分配过了
+	// 通过gfn尝试从 mmu_page_hash 中找到对应的页表页
 	for_each_gfn_valid_sp(vcpu->kvm, sp, gfn) {
 		if (!need_sync && sp->unsync)
 			need_sync = true;
 
 		if (sp->role.word != role.word)
 			continue;
-
+		// 如果该页表页不同步，发送flush请求
 		if (sp->unsync) {
 			/* The page is good, but __kvm_sync_page might still end
 			 * up zapping it.  If so, break in order to rebuild it.
@@ -2155,7 +2174,7 @@ static struct kvm_mmu_page *kvm_mmu_get_page(struct kvm_vcpu *vcpu,
 			WARN_ON(!list_empty(&invalid_list));
 			kvm_make_request(KVM_REQ_TLB_FLUSH, vcpu);
 		}
-
+		// 如果有未同步的spte，发送同步请求
 		if (sp->unsync_children)
 			kvm_make_request(KVM_REQ_MMU_SYNC, vcpu);
 
@@ -2164,12 +2183,13 @@ static struct kvm_mmu_page *kvm_mmu_get_page(struct kvm_vcpu *vcpu,
 		return sp;
 	}
 
+	// 如果没找到，需要分配一个新page
 	++vcpu->kvm->stat.mmu_cache_miss;
-
 	sp = kvm_mmu_alloc_page(vcpu, direct);
 
 	sp->gfn = gfn;
 	sp->role = role;
+	// 将该page以gfn为key加入到 mmu_page_hash
 	hlist_add_head(&sp->hash_link,
 		&vcpu->kvm->arch.mmu_page_hash[kvm_page_table_hashfn(gfn)]);
 	if (!direct) {
@@ -2186,7 +2206,9 @@ static struct kvm_mmu_page *kvm_mmu_get_page(struct kvm_vcpu *vcpu,
 		if (level > PT_PAGE_TABLE_LEVEL && need_sync)
 			flush |= kvm_sync_pages(vcpu, gfn, &invalid_list);
 	}
+	// 设置代数为最新
 	sp->mmu_valid_gen = vcpu->kvm->arch.mmu_valid_gen;
+	// 清空该页的所有页表项
 	clear_page(sp->spt);
 	trace_kvm_mmu_get_page(sp, true);
 
@@ -2197,15 +2219,21 @@ static struct kvm_mmu_page *kvm_mmu_get_page(struct kvm_vcpu *vcpu,
 static void shadow_walk_init(struct kvm_shadow_walk_iterator *iterator,
 			     struct kvm_vcpu *vcpu, u64 addr)
 {
+	// 设置目标GPA
 	iterator->addr = addr;
+	// 设置EPTP
 	iterator->shadow_addr = vcpu->arch.mmu.root_hpa;
+	// 设置当前级别
 	iterator->level = vcpu->arch.mmu.shadow_root_level;
 
+	// 如果EPT是4级，但guest页表小于4级，说明guest可能是32bit，从level 3开始
 	if (iterator->level == PT64_ROOT_LEVEL &&
 	    vcpu->arch.mmu.root_level < PT64_ROOT_LEVEL &&
 	    !vcpu->arch.mmu.direct_map)
 		--iterator->level;
 
+	// 在PAE下，EPT只有三级
+	// ???
 	if (iterator->level == PT32E_ROOT_LEVEL) {
 		iterator->shadow_addr
 			= vcpu->arch.mmu.pae_root[(addr >> 30) & 3];
@@ -2218,10 +2246,12 @@ static void shadow_walk_init(struct kvm_shadow_walk_iterator *iterator,
 
 static bool shadow_walk_okay(struct kvm_shadow_walk_iterator *iterator)
 {
+	// level为0，停止迭代
 	if (iterator->level < PT_PAGE_TABLE_LEVEL)
 		return false;
-
+	// 计算GPA在当前级别分段的值
 	iterator->index = SHADOW_PT_INDEX(iterator->addr, iterator->level);
+	// shadow_addr是HPA，通过__va将HPA转换为HVA，加上index指向在当前级页表对应的pte
 	iterator->sptep	= ((u64 *)__va(iterator->shadow_addr)) + iterator->index;
 	return true;
 }
@@ -2229,11 +2259,12 @@ static bool shadow_walk_okay(struct kvm_shadow_walk_iterator *iterator)
 static void __shadow_walk_next(struct kvm_shadow_walk_iterator *iterator,
 			       u64 spte)
 {
+	// 如果是最后一级，将level设置为0表示停止迭代
 	if (is_last_spte(spte, iterator->level)) {
 		iterator->level = 0;
 		return;
 	}
-
+	// 设置为下一级页表的HPA
 	iterator->shadow_addr = spte & PT64_BASE_ADDR_MASK;
 	--iterator->level;
 }
@@ -2614,6 +2645,8 @@ static bool mmu_set_spte(struct kvm_vcpu *vcpu, u64 *sptep, unsigned pte_access,
 		 * If we overwrite a PTE page pointer with a 2MB PMD, unlink
 		 * the parent of the now unreachable PTE.
 		 */
+		// 大于PT_PAGE_TABLE_LEVEL表示是hugepage，如果原来已有指向下一级页表的普通的pte，需要更换为直接指向hugepage
+		// 因此这里需要先从当前页表项sptep中删掉
 		if (level > PT_PAGE_TABLE_LEVEL &&
 		    !is_large_pte(*sptep)) {
 			struct kvm_mmu_page *child;
@@ -2630,7 +2663,7 @@ static bool mmu_set_spte(struct kvm_vcpu *vcpu, u64 *sptep, unsigned pte_access,
 		} else
 			was_rmapped = 1;
 	}
-
+	// 设置页表项为pfn的起始地址
 	if (set_spte(vcpu, sptep, pte_access, level, gfn, pfn, speculative,
 	      true, host_writable)) {
 		if (write_fault)
@@ -2650,6 +2683,7 @@ static bool mmu_set_spte(struct kvm_vcpu *vcpu, u64 *sptep, unsigned pte_access,
 		++vcpu->kvm->stat.lpages;
 
 	if (is_shadow_present_pte(*sptep)) {
+		// 将当前页表页加入到slot的rmap中
 		if (!was_rmapped) {
 			rmap_count = rmap_add(vcpu, sptep, gfn);
 			if (rmap_count > RMAP_RECYCLE_THRESHOLD)
@@ -2754,8 +2788,11 @@ static int __direct_map(struct kvm_vcpu *vcpu, int write, int map_writable,
 	if (!VALID_PAGE(vcpu->arch.mmu.root_hpa))
 		return 0;
 
+	// 遍历每一级页表(从root开始)
 	for_each_shadow_entry(vcpu, (u64)gfn << PAGE_SHIFT, iterator) {
+		// 最后一级页表，不考虑hugepage为level 1(PT)
 		if (iterator.level == level) {
+			// 设置页表项为物理页的起始HPA
 			emulate = mmu_set_spte(vcpu, iterator.sptep, ACC_ALL,
 					       write, level, gfn, pfn, prefault,
 					       map_writable);
@@ -2763,16 +2800,19 @@ static int __direct_map(struct kvm_vcpu *vcpu, int write, int map_writable,
 			++vcpu->stat.pf_fixed;
 			break;
 		}
-
+		// 不考虑hugepage为level 2-4(PML4 - PD)
 		drop_large_spte(vcpu, iterator.sptep);
+		// 如果下一级页表页不存在
 		if (!is_shadow_present_pte(*iterator.sptep)) {
 			u64 base_addr = iterator.addr;
-
+			// 仅保留地址中属于当前level段的内容，其他全设置为0
 			base_addr &= PT64_LVL_ADDR_MASK(iterator.level);
 			pseudo_gfn = base_addr >> PAGE_SHIFT;
+			// 分配一个页表页，作为下一级页表
+			// 因为是下一级页表，所以是当前level - 1。在EPT下，direct参数为1，在SPT下dirct为0
 			sp = kvm_mmu_get_page(vcpu, pseudo_gfn, iterator.addr,
 					      iterator.level - 1, 1, ACC_ALL);
-
+			// 将该页表页的起始HPA填到当前页表中
 			link_shadow_page(vcpu, iterator.sptep, sp);
 		}
 	}
@@ -3551,6 +3591,7 @@ static int tdp_page_fault(struct kvm_vcpu *vcpu, gva_t gpa, u32 error_code,
 	if (page_fault_handle_page_track(vcpu, error_code, gfn))
 		return 1;
 
+	// 保证各cache充足
 	r = mmu_topup_memory_caches(vcpu);
 	if (r)
 		return r;
@@ -4244,10 +4285,11 @@ EXPORT_SYMBOL_GPL(kvm_mmu_reset_context);
 int kvm_mmu_load(struct kvm_vcpu *vcpu)
 {
 	int r;
-
+	// 保证各cache充足
 	r = mmu_topup_memory_caches(vcpu);
 	if (r)
 		goto out;
+	// 分配一个 kvm_mmu_page 作为根页表，并将该页的spt(strcut page)的HPA加载到root_hpa中
 	r = mmu_alloc_roots(vcpu);
 	kvm_mmu_sync_roots(vcpu);
 	if (r)
@@ -4602,7 +4644,7 @@ static int alloc_mmu_pages(struct kvm_vcpu *vcpu)
 
 int kvm_mmu_create(struct kvm_vcpu *vcpu)
 {
-	vcpu->arch.walk_mmu = &vcpu->arch.mmu;
+	vcpu->arch.walk_mmu = &vcpu->arch.mmu;			// walk_mmu就是mmu，可混用
 	vcpu->arch.mmu.root_hpa = INVALID_PAGE;
 	vcpu->arch.mmu.translate_gpa = translate_gpa;
 	vcpu->arch.nested_mmu.translate_gpa = translate_nested_gpa;
