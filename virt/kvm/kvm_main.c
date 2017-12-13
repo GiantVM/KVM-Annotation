@@ -905,6 +905,7 @@ int __kvm_set_memory_region(struct kvm *kvm,
 	int as_id, id;
 	enum kvm_mr_change change;
 
+	// 检查flags是否合法，目前只支持 KVM_MEM_LOG_DIRTY_PAGES / KVM_MEM_READONLY
 	r = check_memory_region_flags(mem);
 	if (r)
 		goto out;
@@ -914,11 +915,14 @@ int __kvm_set_memory_region(struct kvm *kvm,
 	id = (u16)mem->slot;
 
 	/* General sanity checks */
+	// 大小需要为页的整数倍
 	if (mem->memory_size & (PAGE_SIZE - 1))
 		goto out;
+	// guest起始地址要页对齐
 	if (mem->guest_phys_addr & (PAGE_SIZE - 1))
 		goto out;
 	/* We can read the guest memory with __xxx_user() later on. */
+	// host的地址地址要页对齐，且有写权限
 	if ((id < KVM_USER_MEM_SLOTS) &&
 	    ((mem->userspace_addr & (PAGE_SIZE - 1)) ||
 	     !access_ok(VERIFY_WRITE,
@@ -929,9 +933,13 @@ int __kvm_set_memory_region(struct kvm *kvm,
 		goto out;
 	if (mem->guest_phys_addr + mem->memory_size < mem->guest_phys_addr)
 		goto out;
-
+	// 通过id_to_index数组将QEMU的slot id映射为KVM下的slot id，目前两者相等，见 kvm_create_vm => kvm_alloc_memslots
+	// 同时根据AddressSpace id取出 kvm->memslots[as_id]
+	// 然后通过 id_to_memslot 从中取出对应的 kvm_memory_slot (kvm->memslots[as_id]->memslots[id])
 	slot = id_to_memslot(__kvm_memslots(kvm, as_id), id);
+	// 根据region信息设置slot
 	base_gfn = mem->guest_phys_addr >> PAGE_SHIFT;
+	// 计算有多少页，此后以页为单位
 	npages = mem->memory_size >> PAGE_SHIFT;
 
 	if (npages > KVM_MEM_MAX_NR_PAGES)
@@ -943,18 +951,20 @@ int __kvm_set_memory_region(struct kvm *kvm,
 	new.base_gfn = base_gfn;
 	new.npages = npages;
 	new.flags = mem->flags;
-
+	// 如果现在没页，则是删除slot; 如果现在有页而原来没有，则是新增slot;否则是修改slot
 	if (npages) {
 		if (!old.npages)
 			change = KVM_MR_CREATE;
 		else { /* Modify an existing slot. */
+			// 不能改变 GVA、slot大小、只读状态
 			if ((mem->userspace_addr != old.userspace_addr) ||
 			    (npages != old.npages) ||
 			    ((new.flags ^ old.flags) & KVM_MEM_READONLY))
 				goto out;
-
+			// GPA有变，需要进行移动
 			if (base_gfn != old.base_gfn)
 				change = KVM_MR_MOVE;
+			// flags有变(只可能是KVM_MEM_LOG_DIRTY_PAGES)
 			else if (new.flags != old.flags)
 				change = KVM_MR_FLAGS_ONLY;
 			else { /* Nothing to change. */
@@ -963,6 +973,7 @@ int __kvm_set_memory_region(struct kvm *kvm,
 			}
 		}
 	} else {
+		// 如果原来也没有页，无需删除
 		if (!old.npages)
 			goto out;
 
@@ -974,6 +985,7 @@ int __kvm_set_memory_region(struct kvm *kvm,
 	if ((change == KVM_MR_CREATE) || (change == KVM_MR_MOVE)) {
 		/* Check for overlaps */
 		r = -EEXIST;
+		// 遍历所有user的 kvm_memory_slot，检查GPA范围是否有重叠，如果是，返回 -EEXIST
 		kvm_for_each_memslot(slot, __kvm_memslots(kvm, as_id)) {
 			if ((slot->id >= KVM_USER_MEM_SLOTS) ||
 			    (slot->id == id))
@@ -985,32 +997,37 @@ int __kvm_set_memory_region(struct kvm *kvm,
 	}
 
 	/* Free page dirty bitmap if unneeded */
+	// 如果flags中无KVM_MEM_LOG_DIRTY_PAGES，无需再维护dirty_bitmap
 	if (!(new.flags & KVM_MEM_LOG_DIRTY_PAGES))
 		new.dirty_bitmap = NULL;
 
 	r = -ENOMEM;
 	if (change == KVM_MR_CREATE) {
 		new.userspace_addr = mem->userspace_addr;
-
+		// 为memslot创建rmap和lpage_info
 		if (kvm_arch_create_memslot(kvm, &new, npages))
 			goto out_free;
 	}
 
 	/* Allocate page dirty bitmap if needed */
+	// 如果flags中新增了KVM_MEM_LOG_DIRTY_PAGES，需要创建dirty_bitmap，大小为 npage/8
 	if ((new.flags & KVM_MEM_LOG_DIRTY_PAGES) && !new.dirty_bitmap) {
 		if (kvm_create_dirty_bitmap(&new) < 0)
 			goto out_free;
 	}
 
+	// 创建 kvm->memslots 的临时副本
+	// 然后用修改后的副本替换kvm->memslots，这样做的目的是为了保证操作的原子性?
 	slots = kvm_kvzalloc(sizeof(struct kvm_memslots));
 	if (!slots)
 		goto out_free;
 	memcpy(slots, __kvm_memslots(kvm, as_id), sizeof(struct kvm_memslots));
 
+	// 对于 KVM_MR_MOVE 来说，通过移除旧的然后添加新的来实现
 	if ((change == KVM_MR_DELETE) || (change == KVM_MR_MOVE)) {
 		slot = id_to_memslot(slots, id);
+		// 将副本中的该slot标记为invalid
 		slot->flags |= KVM_MEMSLOT_INVALID;
-
 		old_memslots = install_new_memslots(kvm, as_id, slots);
 
 		/* slot was deleted or moved, clear iommu mapping */
@@ -1059,6 +1076,7 @@ int __kvm_set_memory_region(struct kvm *kvm,
 	 * changes) is disallowed above, so any other attribute changes getting
 	 * here can be skipped.
 	 */
+	// 重新映射内存
 	if ((change == KVM_MR_CREATE) || (change == KVM_MR_MOVE)) {
 		r = kvm_iommu_map_pages(kvm, &new);
 		return r;
@@ -1394,9 +1412,10 @@ static bool hva_to_pfn_fast(unsigned long addr, bool atomic, bool *async,
 	 */
 	if (!(write_fault || writable))
 		return false;
-
+	// 请求一个page，返回值为成功分配的page数，第四个参数用于存放分配的页
 	npages = __get_user_pages_fast(addr, 1, 1, page);
 	if (npages == 1) {
+		// 分配成功，获取其pfn
 		*pfn = page_to_pfn(page[0]);
 
 		if (writable)
@@ -1536,7 +1555,7 @@ static kvm_pfn_t hva_to_pfn(unsigned long addr, bool atomic, bool *async,
 
 	if (atomic)
 		return KVM_PFN_ERR_FAULT;
-
+	// 如果fast不行，退化到slow
 	npages = hva_to_pfn_slow(addr, async, write_fault, writable, &pfn);
 	if (npages == 1)
 		return pfn;

@@ -104,6 +104,8 @@
 #define KVM_HPAGE_SHIFT(x)	(PAGE_SHIFT + KVM_HPAGE_GFN_SHIFT(x))
 #define KVM_HPAGE_SIZE(x)	(1UL << KVM_HPAGE_SHIFT(x))
 #define KVM_HPAGE_MASK(x)	(~(KVM_HPAGE_SIZE(x) - 1))
+// level x级hugepage页表管理的内存区域是普通页表的KVM_HPAGE_GFN_SHIFT(x)倍，比如level 2时为普通页表的2^9=512倍
+// 因为它每一个pte都管理了一个2M的页，是普通4K页的512倍
 #define KVM_PAGES_PER_HPAGE(x)	(KVM_HPAGE_SIZE(x) / PAGE_SIZE)
 
 static inline gfn_t gfn_to_index(gfn_t gfn, gfn_t base_gfn, int level)
@@ -231,16 +233,16 @@ struct kvm_mmu_memory_cache {
 union kvm_mmu_page_role {
 	unsigned word;
 	struct {
-		unsigned level:4;
-		unsigned cr4_pae:1;
-		unsigned quadrant:2;
+		unsigned level:4;		   	// 页所处的层级
+		unsigned cr4_pae:1;		 	// cr4.pae，1表示使用64bit gpte
+		unsigned quadrant:2;		// 如果cr4.pae=0，则gpte为32bit，但spte为64bit，因此需要用多个spte来表示一个gpte，该字段指示是gpte的第几块
 		unsigned direct:1;
-		unsigned access:3;
-		unsigned invalid:1;
-		unsigned nxe:1;
-		unsigned cr0_wp:1;
-		unsigned smep_andnot_wp:1;
-		unsigned smap_andnot_wp:1;
+		unsigned access:3;		  	// 访问权限
+		unsigned invalid:1;		 	// 失效，一旦unpin就会被销毁
+		unsigned nxe:1;			 	// efer.nxe
+		unsigned cr0_wp:1;		  	// cr0.wp，写保护
+		unsigned smep_andnot_wp:1;  // cr4.smep && !cr0.wp
+		unsigned smap_andnot_wp:1;  // cr4.smap && !cr0.wp
 		unsigned :8;
 
 		/*
@@ -249,7 +251,7 @@ union kvm_mmu_page_role {
 		 * simple shift.  While there is room, give it a whole
 		 * byte so it is also faster to load it from memory.
 		 */
-		unsigned smm:8;
+		unsigned smm:8;			 // 处于system management mode
 	};
 };
 
@@ -258,39 +260,39 @@ struct kvm_rmap_head {
 };
 
 struct kvm_mmu_page {
-	struct list_head link;
-	struct hlist_node hash_link;
+	struct list_head link;						  	// 加到 kvm->arch.active_mmu_pages 或 invalid_list ，表示当前页处于的状态
+	struct hlist_node hash_link;					// 加到 vcpu->kvm->arch.mmu_page_hash ，提供快速查找
 
 	/*
 	 * The following two entries are used to key the shadow page in the
 	 * hash table.
 	 */
-	gfn_t gfn;
-	union kvm_mmu_page_role role;
+	gfn_t gfn;									  	// 管理地址范围的起始地址对应的gfn
+	union kvm_mmu_page_role role;				   	// 基本信息，包括硬件特性和所属层级等
 
-	u64 *spt;
+	u64 *spt;									   	// 指向struct page的地址，其包含了所有页表项(pte)。同时page->private会指向该 kvm_mmu_page
 	/* hold the gfn of each spte inside spt */
-	gfn_t *gfns;
-	bool unsync;
-	int root_count;          /* Currently serving as active root */
-	unsigned int unsync_children;
-	struct kvm_rmap_head parent_ptes; /* rmap pointers to parent sptes */
+	gfn_t *gfns;									// 所有页表项(pte)对应的gfn
+	bool unsync;									// 用于最后一级页表页，表示该页的页表项(pte)是否与guest同步(guest是否已更新tlb)
+	int root_count;		  /* Currently serving as active root */ // 用于最高级页表页，统计有多少EPTP指向自身
+	unsigned int unsync_children;				   	// 页表页中unsync的pte数
+	struct kvm_rmap_head parent_ptes; /* rmap pointers to parent sptes */ // 反向映射(rmap)，维护指向自己的上级页表项
 
 	/* The page is obsolete if mmu_valid_gen != kvm->arch.mmu_valid_gen.  */
-	unsigned long mmu_valid_gen;
+	unsigned long mmu_valid_gen;					// 代数，如果比 kvm->arch.mmu_valid_gen 小则表示已失效
 
-	DECLARE_BITMAP(unsync_child_bitmap, 512);
+	DECLARE_BITMAP(unsync_child_bitmap, 512);	   	// 页表页中unsync的spte bitmap
 
 #ifdef CONFIG_X86_32
 	/*
 	 * Used out of the mmu-lock to avoid reading spte values while an
 	 * update is in progress; see the comments in __get_spte_lockless().
 	 */
-	int clear_spte_count;
+	int clear_spte_count;						   	// 32bit下，对spte的修改是原子的，因此通过该计数来检测是否正在被修改，如果被改了需要redo
 #endif
 
 	/* Number of writes since the last time traversal visited this page.  */
-	atomic_t write_flooding_count;
+	atomic_t write_flooding_count;				  	// 统计从上次使用以来的emulation次数，如果超过一定次数，会把该page给unmap掉
 };
 
 struct kvm_pio_request {
@@ -327,11 +329,11 @@ struct kvm_mmu {
 	void (*invlpg)(struct kvm_vcpu *vcpu, gva_t gva);
 	void (*update_pte)(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
 			   u64 *spte, const void *pte);
-	hpa_t root_hpa;
-	int root_level;
-	int shadow_root_level;
-	union kvm_mmu_page_role base_role;
-	bool direct_map;
+	hpa_t root_hpa;						// 根页表页物理地址，EPT下为EPTP
+	int root_level;						// guest中页表的级数
+	int shadow_root_level;				// 影子页表/EPT页表级数
+	union kvm_mmu_page_role base_role;	// 硬件特性
+	bool direct_map;					// SPT为false，EPT为true
 
 	/*
 	 * Bitmap; bit set = permission fault

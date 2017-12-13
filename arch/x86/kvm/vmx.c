@@ -3991,9 +3991,11 @@ static void vmx_set_cr3(struct kvm_vcpu *vcpu, unsigned long cr3)
 	u64 eptp;
 
 	guest_cr3 = cr3;
+	// 如果开启了EPT，将 vcpu->arch.mmu.root_hpa (EPTP)写入到VMCS中
 	if (enable_ept) {
 		eptp = construct_eptp(cr3);
 		vmcs_write64(EPT_POINTER, eptp);
+		// 读取guest的cr3
 		if (is_paging(vcpu) || is_guest_mode(vcpu))
 			guest_cr3 = kvm_read_cr3(vcpu);
 		else
@@ -4002,6 +4004,9 @@ static void vmx_set_cr3(struct kvm_vcpu *vcpu, unsigned long cr3)
 	}
 
 	vmx_flush_tlb(vcpu);
+	// 重设guest的cr3
+	// 对于EPT来说，设置为前面刚读取出来那个guest cr3
+	// 对于SPT来说，设置为 vcpu->arch.mmu.root_hpa ，即guest使用VMM维护的SPT作为页表
 	vmcs_writel(GUEST_CR3, guest_cr3);
 }
 
@@ -4458,15 +4463,18 @@ static int init_rmode_identity_map(struct kvm *kvm)
 
 	identity_map_pfn = kvm->arch.ept_identity_map_addr >> PAGE_SHIFT;
 
+	// 创建identity_map，大小为一个页，地址为 VMX_EPT_IDENTITY_PAGETABLE_ADDR
 	r = alloc_identity_pagetable(kvm);
 	if (r < 0)
 		goto out2;
 
 	idx = srcu_read_lock(&kvm->srcu);
+	// 清空identity_map
 	r = kvm_clear_guest_page(kvm, identity_map_pfn, 0, PAGE_SIZE);
 	if (r < 0)
 		goto out;
 	/* Set up identity-mapping pagetable for EPT in real mode */
+	// 建立1024个等值映射，用于实模式
 	for (i = 0; i < PT32_ENT_PER_PAGE; i++) {
 		tmp = (i << 22) + (_PAGE_PRESENT | _PAGE_RW | _PAGE_USER |
 			_PAGE_ACCESSED | _PAGE_DIRTY | _PAGE_PSE);
@@ -8812,6 +8820,8 @@ void vmx_arm_hv_timer(struct kvm_vcpu *vcpu)
 	vmcs_write32(VMX_PREEMPTION_TIMER_VALUE, delta_tsc);
 }
 
+
+// 执行 VMLAUNCH / VMRESUME，进入non-root mode
 static void __noclone vmx_vcpu_run(struct kvm_vcpu *vcpu)
 {
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
@@ -8836,11 +8846,13 @@ static void __noclone vmx_vcpu_run(struct kvm_vcpu *vcpu)
 		vmx->nested.sync_shadow_vmcs = false;
 	}
 
+	// 如果host的rsp和rip脏了，需要更新vmcs
 	if (test_bit(VCPU_REGS_RSP, (unsigned long *)&vcpu->arch.regs_dirty))
 		vmcs_writel(GUEST_RSP, vcpu->arch.regs[VCPU_REGS_RSP]);
 	if (test_bit(VCPU_REGS_RIP, (unsigned long *)&vcpu->arch.regs_dirty))
 		vmcs_writel(GUEST_RIP, vcpu->arch.regs[VCPU_REGS_RIP]);
 
+	// 查看per-cpu变量的cr4有没变，有变则写到vmcs，且更新vmx->host_state
 	cr4 = cr4_read_shadow();
 	if (unlikely(cr4 != vmx->host_state.vmcs_host_cr4)) {
 		vmcs_writel(HOST_CR4, cr4);
@@ -8852,6 +8864,7 @@ static void __noclone vmx_vcpu_run(struct kvm_vcpu *vcpu)
 	 * vmentry fails as it then expects bit 14 (BS) in pending debug
 	 * exceptions being set, but that's not correct for the guest debugging
 	 * case. */
+	// 单步调试时需要禁用guest中断
 	if (vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP)
 		vmx_set_interrupt_shadow(vcpu, 0);
 
@@ -8866,24 +8879,26 @@ static void __noclone vmx_vcpu_run(struct kvm_vcpu *vcpu)
 	vmx->__launched = vmx->loaded_vmcs->launched;
 	asm(
 		/* Store host registers */
-		"push %%" _ASM_DX "; push %%" _ASM_BP ";"
-		"push %%" _ASM_CX " \n\t" /* placeholder for guest rcx */
+		"push %%" _ASM_DX "; push %%" _ASM_BP ";"  						// rdx，rbp压栈
+		"push %%" _ASM_CX " \n\t" /* placeholder for guest rcx */       // rcx压栈，同时为guest的rcx寄存器保留位置
 		"push %%" _ASM_CX " \n\t"
-		"cmp %%" _ASM_SP ", %c[host_rsp](%0) \n\t"
+		// 保存Host-state
+		// %c表示使用立即数替换但不使用立即数语法($)，%0为传入的第一个参数，这里是vmx
+		"cmp %%" _ASM_SP ", %c[host_rsp](%0) \n\t"  				    // 比较当前rsp和vmx->host_rsp的值
 		"je 1f \n\t"
-		"mov %%" _ASM_SP ", %c[host_rsp](%0) \n\t"
-		__ex(ASM_VMX_VMWRITE_RSP_RDX) "\n\t"
+		"mov %%" _ASM_SP ", %c[host_rsp](%0) \n\t"						// 如果不相等，更新vmx->host_rsp
+		__ex(ASM_VMX_VMWRITE_RSP_RDX) "\n\t"							// vmwrite将rsp写入vmcs
 		"1: \n\t"
 		/* Reload cr2 if changed */
 		"mov %c[cr2](%0), %%" _ASM_AX " \n\t"
 		"mov %%cr2, %%" _ASM_DX " \n\t"
-		"cmp %%" _ASM_AX ", %%" _ASM_DX " \n\t"
+		"cmp %%" _ASM_AX ", %%" _ASM_DX " \n\t"							// 比较当前cr2和vmx->cr2的值
 		"je 2f \n\t"
-		"mov %%" _ASM_AX", %%cr2 \n\t"
+		"mov %%" _ASM_AX", %%cr2 \n\t"									// 如果不相等，更新cr2
 		"2: \n\t"
 		/* Check if vmlaunch of vmresume is needed */
-		"cmpl $0, %c[launched](%0) \n\t"
-		/* Load guest registers.  Don't clobber flags. */
+		"cmpl $0, %c[launched](%0) \n\t"  								// 根据vmx->__launched决定是否需要执行VMLAUNCH
+		/* Load guest registers.  Don't clobber flags. */				// 从vmx中加载guest的通用寄存器
 		"mov %c[rax](%0), %%" _ASM_AX " \n\t"
 		"mov %c[rbx](%0), %%" _ASM_BX " \n\t"
 		"mov %c[rdx](%0), %%" _ASM_DX " \n\t"
@@ -8900,18 +8915,18 @@ static void __noclone vmx_vcpu_run(struct kvm_vcpu *vcpu)
 		"mov %c[r14](%0), %%r14 \n\t"
 		"mov %c[r15](%0), %%r15 \n\t"
 #endif
-		"mov %c[rcx](%0), %%" _ASM_CX " \n\t" /* kills %0 (ecx) */
+		"mov %c[rcx](%0), %%" _ASM_CX " \n\t" /* kills %0 (ecx) */		// 因为host的rcx存放了vmx的指针，最后才加载guest的rcx
 
 		/* Enter guest mode */
-		"jne 1f \n\t"
+		"jne 1f \n\t"   												// 如果vcpu_vmx->__launched为1，则执行VMLAUNCH
 		__ex(ASM_VMX_VMLAUNCH) "\n\t"
 		"jmp 2f \n\t"
-		"1: " __ex(ASM_VMX_VMRESUME) "\n\t"
+		"1: " __ex(ASM_VMX_VMRESUME) "\n\t"  							// 否则执行VMRESUME
 		"2: "
-		/* Save guest registers, load host registers, keep flags */
+		/* Save guest registers, load host registers, keep flags */     // 注意，直到VMEXIT才会继续执行下面代码
 		"mov %0, %c[wordsize](%%" _ASM_SP ") \n\t"
-		"pop %0 \n\t"
-		"mov %%" _ASM_AX ", %c[rax](%0) \n\t"
+		"pop %0 \n\t"													// 恢复host寄存器，将先前压入的rcx出栈，恢复rcx为vmx
+		"mov %%" _ASM_AX ", %c[rax](%0) \n\t"							// 将guest的通用寄存器保存到vmx中
 		"mov %%" _ASM_BX ", %c[rbx](%0) \n\t"
 		__ASM_SIZE(pop) " %c[rcx](%0) \n\t"
 		"mov %%" _ASM_DX ", %c[rdx](%0) \n\t"
@@ -8928,17 +8943,17 @@ static void __noclone vmx_vcpu_run(struct kvm_vcpu *vcpu)
 		"mov %%r14, %c[r14](%0) \n\t"
 		"mov %%r15, %c[r15](%0) \n\t"
 #endif
-		"mov %%cr2, %%" _ASM_AX "   \n\t"
+		"mov %%cr2, %%" _ASM_AX "   \n\t"								// 将guest的cr2保存到vmx中
 		"mov %%" _ASM_AX ", %c[cr2](%0) \n\t"
 
-		"pop  %%" _ASM_BP "; pop  %%" _ASM_DX " \n\t"
+		"pop  %%" _ASM_BP "; pop  %%" _ASM_DX " \n\t"					// 恢复host寄存器，即先前压栈的rbp，rdx
 		"setbe %c[fail](%0) \n\t"
 		".pushsection .rodata \n\t"
 		".global vmx_return \n\t"
 		"vmx_return: " _ASM_PTR " 2b \n\t"
 		".popsection"
-	      : : "c"(vmx), "d"((unsigned long)HOST_RSP),
-		[launched]"i"(offsetof(struct vcpu_vmx, __launched)),
+	      : : "c"(vmx), "d"((unsigned long)HOST_RSP),					// 输入参数，vmx放到rcx中，HOSTRSP放到rdx中
+		[launched]"i"(offsetof(struct vcpu_vmx, __launched)),  			// 获取了各寄存器变量在vmx中的偏移量
 		[fail]"i"(offsetof(struct vcpu_vmx, fail)),
 		[host_rsp]"i"(offsetof(struct vcpu_vmx, host_rsp)),
 		[rax]"i"(offsetof(struct vcpu_vmx, vcpu.arch.regs[VCPU_REGS_RAX])),
@@ -8959,7 +8974,7 @@ static void __noclone vmx_vcpu_run(struct kvm_vcpu *vcpu)
 		[r15]"i"(offsetof(struct vcpu_vmx, vcpu.arch.regs[VCPU_REGS_R15])),
 #endif
 		[cr2]"i"(offsetof(struct vcpu_vmx, vcpu.arch.cr2)),
-		[wordsize]"i"(sizeof(ulong))
+		[wordsize]"i"(sizeof(ulong))									// 用到的寄存器
 	      : "cc", "memory"
 #ifdef CONFIG_X86_64
 		, "rax", "rbx", "rdi", "rsi"
@@ -8982,10 +8997,12 @@ static void __noclone vmx_vcpu_run(struct kvm_vcpu *vcpu)
 	 * may be executed in interrupt context, which saves and restore segments
 	 * around it, nullifying its effect.
 	 */
+	// 需要立即加载ds和es为用户态段
 	loadsegment(ds, __USER_DS);
 	loadsegment(es, __USER_DS);
 #endif
-
+	// 设置当前不可用的寄存器，包括rip、rflags、kvm_reg_ex中的寄存器
+	// 这样当在 kvm_register_read 中test_bit发现不可用时，会通过vmcs_readl去读
 	vcpu->arch.regs_avail = ~((1 << VCPU_REGS_RIP) | (1 << VCPU_REGS_RSP)
 				  | (1 << VCPU_EXREG_RFLAGS)
 				  | (1 << VCPU_EXREG_PDPTR)
@@ -8993,10 +9010,13 @@ static void __noclone vmx_vcpu_run(struct kvm_vcpu *vcpu)
 				  | (1 << VCPU_EXREG_CR3));
 	vcpu->arch.regs_dirty = 0;
 
+	// 读取中断向量表信息
 	vmx->idt_vectoring_info = vmcs_read32(IDT_VECTORING_INFO_FIELD);
 
+	// 标记已经launch过，下次会执行VMRESUME
 	vmx->loaded_vmcs->launched = 1;
 
+	// 读取VMEXIT的原因
 	vmx->exit_reason = vmcs_read32(VM_EXIT_REASON);
 
 	/*
@@ -9023,6 +9043,7 @@ static void __noclone vmx_vcpu_run(struct kvm_vcpu *vcpu)
 
 	vmx->nested.nested_run_pending = 0;
 
+	// 处理MCE异常和NMI中断
 	vmx_complete_atomic_exit(vmx);
 	vmx_recover_nmi_blocking(vmx);
 	vmx_complete_interrupts(vmx);
@@ -9159,7 +9180,7 @@ static struct kvm_vcpu *vmx_create_vcpu(struct kvm *kvm, unsigned int id)
         if (!kvm->arch.ept_identity_map_addr)
             kvm->arch.ept_identity_map_addr =
                 VMX_EPT_IDENTITY_PAGETABLE_ADDR;
-        // 初始化identity页表???
+        // 初始化实模式页表 identify_map
         err = init_rmode_identity_map(kvm);
         if (err)
             goto free_vmcs;
