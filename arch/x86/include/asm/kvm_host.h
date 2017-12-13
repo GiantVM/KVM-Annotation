@@ -568,9 +568,14 @@ struct kvm_vcpu_arch {
 	bool pvclock_set_guest_stopped_request;
 
 	struct {
+		// MSR_KVM_STEAL_TIME的值，表示是否启用steal time功能，以及若启用，
+		// Guest中struct kvm_steal_time的GPA
 		u64 msr_val;
+		// 上次更新时的总steal time
 		u64 last_steal;
+		// 用于cache该vCPU上的struct kvm_steal_time
 		struct gfn_to_hva_cache stime;
+		// 用于临时存储从Guest复制来的struct kvm_steal_time
 		struct kvm_steal_time steal;
 	} st;
 

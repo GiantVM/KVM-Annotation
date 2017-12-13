@@ -300,7 +300,7 @@ static void kvm_register_steal_time(void)
 
 	if (!has_steal_clock)
 		return;
-	// 写入MSR，告诉VMM struct kvm_steal_time的地址
+	// 写入MSR，告诉kvm struct kvm_steal_time的地址
 	wrmsrl(MSR_KVM_STEAL_TIME, (slow_virt_to_phys(st) | KVM_MSR_ENABLED));
 	pr_info("kvm-stealtime: cpu %d, msr %llx\n",
 		cpu, (unsigned long long) slow_virt_to_phys(st));
@@ -481,7 +481,8 @@ void __init kvm_guest_init(void)
 	if (kvm_para_has_feature(KVM_FEATURE_ASYNC_PF))
 		x86_init.irqs.trap_init = kvm_apf_trap_init;
 
-	// 注册steal函数
+	// 若从kvm模拟的CPUID leaf中发现支持steal time功能，
+	// 则注册steal_clock函数用于读取steal time
 	if (kvm_para_has_feature(KVM_FEATURE_STEAL_TIME)) {
 		has_steal_clock = 1;
 		pv_time_ops.steal_clock = kvm_steal_clock;

@@ -2236,16 +2236,22 @@ static void record_steal_time(struct kvm_vcpu *vcpu)
 		&vcpu->arch.st.steal, sizeof(struct kvm_steal_time))))
 		return;
 
+	// 只有首次写入steal_time时，由于steal_time没有初始化为0，导致读出垃圾值，
+	// 才可能造成version为奇数，此时修复成偶数
 	if (vcpu->arch.st.steal.version & 1)
 		vcpu->arch.st.steal.version += 1;  /* first time write, random junk */
 
+	// 将version置为奇数，表示正在修改
 	vcpu->arch.st.steal.version += 1;
 
 	kvm_write_guest_cached(vcpu->kvm, &vcpu->arch.st.stime,
 		&vcpu->arch.st.steal, sizeof(struct kvm_steal_time));
 
+	// Guest的各vCPU都能读取steal time，故应保证其他vCPU所见的更新顺序
 	smp_wmb();
 
+	// kvm_steal_time.steal表示的是vCPU自启动以来总的未在运行的时间，
+	// 每次更新加上新增的未运行时间即可
 	vcpu->arch.st.steal.steal += current->sched_info.run_delay -
 		vcpu->arch.st.last_steal;
 	vcpu->arch.st.last_steal = current->sched_info.run_delay;
@@ -2253,8 +2259,10 @@ static void record_steal_time(struct kvm_vcpu *vcpu)
 	kvm_write_guest_cached(vcpu->kvm, &vcpu->arch.st.stime,
 		&vcpu->arch.st.steal, sizeof(struct kvm_steal_time));
 
+	// 同上
 	smp_wmb();
 
+	// 将version置为偶数，表示修改完成
 	vcpu->arch.st.steal.version += 1;
 
 	kvm_write_guest_cached(vcpu->kvm, &vcpu->arch.st.stime,
@@ -2994,6 +3002,7 @@ void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
 		if (!vcpu->kvm->arch.use_master_clock || vcpu->cpu == -1)
 			kvm_make_request(KVM_REQ_GLOBAL_CLOCK_UPDATE, vcpu);
 		if (vcpu->cpu != cpu)
+			// 迁移LAPIC和PIT timer
 			kvm_migrate_timers(vcpu);
 		vcpu->cpu = cpu;
 	}
