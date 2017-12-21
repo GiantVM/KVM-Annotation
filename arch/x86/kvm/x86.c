@@ -1587,40 +1587,49 @@ void kvm_write_tsc(struct kvm_vcpu *vcpu, struct msr_data *msr)
 	 * compensation code attempt to catch up if we fall behind, but
 	 * it's better to try to match offsets from the beginning.
 	 *
-	 * 对于usdiff小于一秒的情况，我们理解为Guest试图同步TSC，但仅当各vCPU的
-	 * virtual TSC频率相同时Guest可以同步TSC，否则显然不可能实现同步。
+	 * 如果Guest对TSC进行修改，对于usdiff小于一秒的情况，我们将其理解为Guest试图
+	 * 同步TSC。直观地看，这就是说，如果Guest连续在多个vCPU上进行TSC写入，连续两次
+	 * 写入之间间隔小于一秒，那么我们认为这一组TSC写入是在同步这些vCPU。但要
+	 * 注意的是，仅当各vCPU的virtual TSC频率相同时Guest才能同步TSC，否则显然
+	 * 不可能实现同步。
 	 *
-	 * 我们设计了分代式的Guest TSC同步机制，凡是互相同步的（Guest进行了同步尝试的）
-	 * vCPU，我们算作同一代，若出现一个不与当前正在进行同步的这一代同步的vCPU，
-	 * 则当前正在进行同步的这一代被废弃，开启下一代，以此类推，直到所有vCPU
-	 * 都处在同一代为止，同步成功。
+	 * 此处我们设计了分代式的Guest TSC同步机制，凡是互相同步的（进行了同步尝试
+	 * 且usdiff小于一秒的）vCPU，我们算作同一代，若出现一个不与当前正在进行
+	 * 同步的这一代同步的vCPU，则当前正在进行同步的这一代被废弃，开启下一代，
+	 * 以此类推，直到所有vCPU都处在同一代为止，同步成功。
+	 *
+	 * 特别值得注意的是，在vCPU初始化时，kvm自己会调用kvm_write_tsc，写入data = 0，
+	 * 从而使得vCPU的virtual TSC从零开始计数。kvm创建的vm本身是默认vCPU互相不同步的
+	 * （这很显然，因为nr_vcpus_matched_tsc默认是零），因此只有各依次创建的vCPU之间
+	 * 创建的时间间隔均小于一秒时，vCPU的TSC才会被同步，从而允许开启masterclock模式。
 	 */
 	if (usdiff < USEC_PER_SEC &&
 	    vcpu->arch.virtual_tsc_khz == kvm->arch.last_tsc_khz) {
 		if (!check_tsc_unstable()) {
 			// Host若具备stable TSC，则我们将所有互相同步的vCPU的TSC offset
-			// 设置为同一个值，即可保证它们的同步
+			// 设置为同一个值（即这一代的第一个TSC写入者所请求的data对应
+			// 的offset），即可保证它们的同步。此时，对所有vCPU都有
+			// virtual_tsc = host_tsc + offset相同。
 			offset = kvm->arch.cur_tsc_offset;
 			pr_debug("kvm: matched tsc offset for %llu\n", data);
 		} else {
 			// Host若为unstable TSC，则会开启catch up模式，互相同步的vCPU
 			// 具备相同的this_tsc_nsec和this_tsc_write（即这一代中第一个
 			// 写入TSC者的写入时间和写入值），每次更新Guest时间
-			// （kvm_guest_time_update，至少每300秒会进行一次）时都会据此
+			// （kvm_guest_time_update，至少每300个tick会进行一次）时都会据此
 			// 调整Guest TSC，某vCPU的tsc若走得太慢了则拨快Guest时间，
 			// 若走得太快则无法采取应对措施，因为不能使Guest TSC发生倒退。
 			//
 			// 进行调整时就是调用下文所述的compute_guest_tsc()求得Guest TSC
-			// 理论上的正确值，从而修正当前vCPU上的错误值
+			// 理论上的正确值，从而修正当前vCPU上的错误值。
 			//
-			// XXX 此处为offset加上elapsed似乎是多余的，应是一个历史遗留问题。
-			// 在早期的实现中，diff是不减去elapsed的，也就是说以前是将本次写入的
-			// TSC值与上次写入的值很接近的情况，视为Guest在试图同步TSC。此时，
-			// 可能实际上已经经过了较长时间，故有必要加上elapsed时间从而
-			// 与真实时间匹配。而现在的实现中，已经不需要加上elapsed时间，因为
-			// 从我们对Guest试图同步TSC的新的定义来看，其写入的值data的误差最多
-			// 不超过一秒，否则无法进入这个分支，若再加上elapsed时间反而会导致
-			// 其TSC走得过快
+			// XXX 此处offset取为guest_tsc = data + delta对应的tsc offset，
+			// 应该有误。事实上，如果想让该vCPU的guest_tsc与这一代的vCPU同步，
+			// 应该令guest_tsc = last_tsc_write + delta。
+			//
+			// 这一段代码之所以有效，是因为如果Guest不主动写TSC（例如linux即使
+			// 发现TSC不同步，也不会试图通过写TSC纠正它），那么只有初始化时才会
+			// 执行这段代码。此时，last_tsc_write和data均为0，因此得到正确的结果。
 			u64 delta = nsec_to_cycles(vcpu, elapsed);
 			data += delta;
 			offset = kvm_compute_tsc_offset(vcpu, data);
@@ -1904,6 +1913,7 @@ static void kvm_gen_update_masterclock(struct kvm *kvm)
 		kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
 
 	/* guest entries allowed
+	 *
 	 * 清空该request bit后，各vCPU又能够重新进入Guest模式了
 	 */
 	kvm_for_each_vcpu(i, vcpu, kvm)
@@ -2115,6 +2125,8 @@ static void kvm_gen_kvmclock_update(struct kvm_vcpu *v)
 
 #define KVMCLOCK_SYNC_PERIOD (300 * HZ)
 
+// 每隔300个tick，执行一次kvmclock_update_work，即执行一次kvmclock_update_fn函数，
+// 对每个vCPU调用一次kvm_guest_time_update
 static void kvmclock_sync_fn(struct work_struct *work)
 {
 	struct delayed_work *dwork = to_delayed_work(work);
